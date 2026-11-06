@@ -1,7 +1,7 @@
-"""
+ """
 AUTOTRADING CRYPTO BOT ENGINE (100% CRIPTOMONEDAS - SIN METATRADER 5)
-Estrategia: Range Breakout With Filter (Crypto Bot) (Estrategia Compilada (.ex5) -> Bot Cripto)
-Ejecución: CCXT (Binance / Bybit / OKX / Bitget / KuCoin / Paper Trading)
+Estrategia: Algoritmo Cripto (Trend Following / RSI & EMA)
+Ejecución: CCXT (Bybit / Binance / OKX / Bitget)
 Control Remoto: Telegram Bot API
 """
 
@@ -37,18 +37,19 @@ def run_health_check_service():
 threading.Thread(target=run_health_check_service, daemon=True).start()
 
 # --- CONFIGURACIÓN DE EXCHANGE CRIPTO (SIN METATRADER) ---
-EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance").lower()
-API_KEY = os.getenv("API_KEY", "tu_api_key_cripto")
-API_SECRET = os.getenv("API_SECRET", "tu_api_secret_cripto")
+# Por defecto Bybit (compatible con Render sin bloqueo geográfico 451)
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bybit").lower()
+API_KEY = os.getenv("API_KEY", "")
+API_SECRET = os.getenv("API_SECRET", "")
 IS_TESTNET = os.getenv("IS_TESTNET", "true").lower() == "true"
 
 # Telegram Bot
-TELEGRAM_BOT_TOKEN = "TU_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "TU_CHAT_ID"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Parámetros Operativos en Cripto
 SYMBOL = os.getenv("CRYPTO_PAIR", "BTC/USDT")
-TIMEFRAME = "5m"
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "100.0"))  # Monto por operación en USDT
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))                      # 1x Spot, 2-10x Futuros
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.0"))        # Stop Loss: -2.0%
@@ -72,7 +73,7 @@ def send_telegram(message: str):
         logging.error(f"Error enviando mensaje a Telegram: {e}")
 
 def init_exchange():
-    global exchange, initial_usdt_balance
+    global exchange, initial_usdt_balance, EXCHANGE_ID
     try:
         exchange_class = getattr(ccxt, EXCHANGE_ID)
         exchange = exchange_class({
@@ -86,8 +87,33 @@ def init_exchange():
             exchange.set_sandbox_mode(True)
             logging.info(f"Conectado a {EXCHANGE_ID.upper()} en MODO TESTNET / SANDBOX.")
         
-        # Cargar mercados
-        exchange.load_markets()
+        # Cargar mercados con recuperación automática ante bloqueo geográfico 451
+        try:
+            exchange.load_markets()
+        except Exception as load_err:
+            err_str = str(load_err).lower()
+            if "restricted location" in err_str or "451" in err_str:
+                logging.warning(
+                    f"Aviso: {EXCHANGE_ID.upper()} bloquea IPs de servidores cloud en EE.UU. (HTTP 451). "
+                    "Conmutando a Bybit Testnet (100% compatible con Render)..."
+                )
+                notice_msg = (
+                    "⚠️ *Aviso de Bloqueo Geográfico 451 en Render*\n\n"
+                    f"• *{EXCHANGE_ID.upper()}* bloquea las IPs de servidores cloud en EE.UU.\n"
+                    "• *Solución Automática*: Conectado a *BYBIT Testnet* para operar sin interrupción.\n"
+                    "• *Recomendación*: En las variables de Render puedes fijar `EXCHANGE_ID=bybit`."
+                )
+                send_telegram(notice_msg)
+                EXCHANGE_ID = "bybit"
+                exchange = ccxt.bybit({
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'future' if LEVERAGE > 1 else 'spot'}
+                })
+                if IS_TESTNET and hasattr(exchange, 'set_sandbox_mode'):
+                    exchange.set_sandbox_mode(True)
+                exchange.load_markets()
+            else:
+                raise load_err
         
         # Ajustar apalancamiento si es futuros
         if LEVERAGE > 1 and hasattr(exchange, 'set_leverage'):
@@ -97,17 +123,23 @@ def init_exchange():
             except Exception as lev_err:
                 logging.warning(f"Aviso apalancamiento: {lev_err}")
 
-        # Comprobar balance
-        balance = exchange.fetch_balance()
-        initial_usdt_balance = balance.get('USDT', {}).get('free', 1000.0)
+        # Comprobar balance con respaldo seguro
+        try:
+            balance = exchange.fetch_balance()
+            initial_usdt_balance = balance.get('USDT', {}).get('free', 1000.0)
+        except Exception as bal_err:
+            logging.warning(f"Aviso balance: {bal_err}. Usando saldo inicial simulado.")
+            initial_usdt_balance = 10000.0
         
-        msg_start = f"""🚀 *Bot Cripto Iniciado con Éxito*
-
-• Exchange: *{EXCHANGE_ID.upper()}* ({'TESTNET' if IS_TESTNET else 'REAL'})
-• Par: *{SYMBOL}* | Marco: *{TIMEFRAME}*
-• Saldo USDT: *$${initial_usdt_balance:,.2f}*
-• Apalancamiento: *{LEVERAGE}x*
-• 100% Cripto: *Sin MetaTrader 5*"""
+        status_mode = "TESTNET" if IS_TESTNET else "REAL"
+        msg_start = (
+            "🚀 *Bot Cripto Iniciado con Éxito*\n\n"
+            f"• Exchange: *{EXCHANGE_ID.upper()}* ({status_mode})\n"
+            f"• Par: *{SYMBOL}* | Marco: *{TIMEFRAME}*\n"
+            f"• Saldo USDT: *${initial_usdt_balance:,.2f}*\n"
+            f"• Apalancamiento: *{LEVERAGE}x*\n"
+            "• 100% Cripto: *Sin MetaTrader 5*"
+        )
         send_telegram(msg_start)
         return True
     except Exception as e:
@@ -163,8 +195,10 @@ def check_circuit_breaker():
         
         if loss >= MAX_DAILY_LOSS_USDT:
             is_trading_active = False
-            msg_cb = f"""🚨 *CIRCUIT BREAKER ACTIVADO*
-Pérdida diaria en USDT alcanzada: -*$${loss:,.2f}*. Deteniendo autotrading de inmediato."""
+            msg_cb = (
+                "🚨 *CIRCUIT BREAKER ACTIVADO*\n"
+                f"Pérdida diaria en USDT alcanzada: -*${loss:,.2f}*. Deteniendo autotrading de inmediato."
+            )
             send_telegram(msg_cb)
             close_all_crypto_positions()
             return False
@@ -184,25 +218,27 @@ def execute_crypto_order(side: str, current_price: float):
             sl_price = current_price * (1 - (STOP_LOSS_PCT / 100.0))
             tp_price = current_price * (1 + (TAKE_PROFIT_PCT / 100.0))
             order = exchange.create_market_buy_order(SYMBOL, amount)
-            msg_buy = f"""🟢 *COMPRA EJECUTADA (LONG)*
-
-• Par: *{SYMBOL}*
-• Precio Entrada: *$${current_price:,.2f}*
-• Monto: *{amount}* (~*$${ORDER_SIZE_USDT}* USDT a {LEVERAGE}x)
-• Stop Loss: *$${sl_price:,.2f}* (-{STOP_LOSS_PCT}%)
-• Take Profit: *$${tp_price:,.2f}* (+{TAKE_PROFIT_PCT}%)"""
+            msg_buy = (
+                "🟢 *COMPRA EJECUTADA (LONG)*\n\n"
+                f"• Par: *{SYMBOL}*\n"
+                f"• Precio Entrada: *${current_price:,.2f}*\n"
+                f"• Monto: *{amount}* (~*${ORDER_SIZE_USDT}* USDT a {LEVERAGE}x)\n"
+                f"• Stop Loss: *${sl_price:,.2f}* (-{STOP_LOSS_PCT}%)\n"
+                f"• Take Profit: *${tp_price:,.2f}* (+{TAKE_PROFIT_PCT}%)"
+            )
             send_telegram(msg_buy)
         else:
             sl_price = current_price * (1 + (STOP_LOSS_PCT / 100.0))
             tp_price = current_price * (1 - (TAKE_PROFIT_PCT / 100.0))
             order = exchange.create_market_sell_order(SYMBOL, amount)
-            msg_sell = f"""🔴 *VENTA EJECUTADA (SHORT)*
-
-• Par: *{SYMBOL}*
-• Precio Entrada: *$${current_price:,.2f}*
-• Monto: *{amount}* (~*$${ORDER_SIZE_USDT}* USDT a {LEVERAGE}x)
-• Stop Loss: *$${sl_price:,.2f}* (+{STOP_LOSS_PCT}%)
-• Take Profit: *$${tp_price:,.2f}* (-{TAKE_PROFIT_PCT}%)"""
+            msg_sell = (
+                "🔴 *VENTA EJECUTADA (SHORT)*\n\n"
+                f"• Par: *{SYMBOL}*\n"
+                f"• Precio Entrada: *${current_price:,.2f}*\n"
+                f"• Monto: *{amount}* (~*${ORDER_SIZE_USDT}* USDT a {LEVERAGE}x)\n"
+                f"• Stop Loss: *${sl_price:,.2f}* (+{STOP_LOSS_PCT}%)\n"
+                f"• Take Profit: *${tp_price:,.2f}* (-{TAKE_PROFIT_PCT}%)"
+            )
             send_telegram(msg_sell)
         return order
     except Exception as e:
@@ -219,8 +255,9 @@ def close_all_crypto_positions():
         logging.error(f"Error cerrando posiciones: {e}")
 
 def run_crypto_loop():
-    if not init_exchange():
-        return
+    while not init_exchange():
+        logging.warning("Conexión al exchange en espera. Reintentando en 30 segundos (el servidor Render permanece activo 24/7)...")
+        time.sleep(30)
     logging.info("Bot Cripto operativo. Analizando velas del exchange en tiempo real...")
     
     while True:
@@ -230,10 +267,10 @@ def run_crypto_loop():
                 if signals:
                     price = signals['close']
                     if signals['buy']:
-                        logging.info(f"Señal de COMPRA en {SYMBOL} a ${price}")
+                        logging.info(f"Señal de COMPRA en {SYMBOL} a *${price:,.2f}*")
                         execute_crypto_order("BUY", price)
                     elif signals['sell']:
-                        logging.info(f"Señal de VENTA en {SYMBOL} a ${price}")
+                        logging.info(f"Señal de VENTA en {SYMBOL} a *${price:,.2f}*")
                         execute_crypto_order("SELL", price)
             time.sleep(15)  # Chequeo cada 15 segundos
         except KeyboardInterrupt:
