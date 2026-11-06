@@ -1,10 +1,3 @@
- """
-AUTOTRADING CRYPTO BOT ENGINE (100% CRIPTOMONEDAS - SIN METATRADER 5)
-Estrategia: Algoritmo Cripto (Trend Following / RSI & EMA)
-Ejecución: CCXT (Bybit / Binance / OKX / Bitget)
-Control Remoto: Telegram Bot API
-"""
-
 import time
 import logging
 import os
