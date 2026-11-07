@@ -30,19 +30,18 @@ def run_health_check_service():
 threading.Thread(target=run_health_check_service, daemon=True).start()
 
 # --- CONFIGURACIÓN DE EXCHANGE CRIPTO (SIN METATRADER) ---
-# Por defecto Bybit (compatible con Render sin bloqueo geográfico 451)
-EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bybit").lower()
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance").lower()
+API_KEY = os.getenv("API_KEY", "tu_api_key_cripto")
+API_SECRET = os.getenv("API_SECRET", "tu_api_secret_cripto")
 IS_TESTNET = os.getenv("IS_TESTNET", "true").lower() == "true"
 
 # Telegram Bot
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = "TU_TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "TU_CHAT_ID"
 
 # Parámetros Operativos en Cripto
 SYMBOL = os.getenv("CRYPTO_PAIR", "BTC/USDT")
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+TIMEFRAME = "5m"
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "100.0"))  # Monto por operación en USDT
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))                      # 1x Spot, 2-10x Futuros
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.0"))        # Stop Loss: -2.0%
@@ -68,48 +67,48 @@ def send_telegram(message: str):
 def init_exchange():
     global exchange, initial_usdt_balance, EXCHANGE_ID
     try:
-        exchange_class = getattr(ccxt, EXCHANGE_ID)
-        exchange = exchange_class({
-            'apiKey': API_KEY,
-            'secret': API_SECRET,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future' if LEVERAGE > 1 else 'spot'}
-        })
-        
-        if IS_TESTNET and hasattr(exchange, 'set_sandbox_mode'):
-            exchange.set_sandbox_mode(True)
-            logging.info(f"Conectado a {EXCHANGE_ID.upper()} en MODO TESTNET / SANDBOX.")
-        
-        # Cargar mercados con recuperación automática ante bloqueo geográfico 451
+        is_cloud_blocked = False
         try:
+            exchange_class = getattr(ccxt, EXCHANGE_ID)
+            exchange = exchange_class({
+                'apiKey': API_KEY,
+                'secret': API_SECRET,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future' if LEVERAGE > 1 else 'spot'}
+            })
+            
+            if IS_TESTNET and hasattr(exchange, 'set_sandbox_mode'):
+                exchange.set_sandbox_mode(True)
+                logging.info(f"Conectado a {EXCHANGE_ID.upper()} en MODO TESTNET / SANDBOX.")
+            
             exchange.load_markets()
         except Exception as load_err:
             err_str = str(load_err).lower()
-            if "restricted location" in err_str or "451" in err_str:
+            if any(term in err_str for term in ["restricted location", "451", "403", "cloudfront", "block access from your country", "forbidden"]):
+                is_cloud_blocked = True
                 logging.warning(
-                    f"Aviso: {EXCHANGE_ID.upper()} bloquea IPs de servidores cloud en EE.UU. (HTTP 451). "
-                    "Conmutando a Bybit Testnet (100% compatible con Render)..."
+                    f"Aviso: {EXCHANGE_ID.upper()} bloquea peticiones desde servidores cloud en EE.UU. (Error 403/451 CloudFront). "
+                    "Activando modo de cotizaciones en tiempo real globales (KRAKEN) sin bloqueos de IP..."
                 )
                 notice_msg = (
-                    "⚠️ *Aviso de Bloqueo Geográfico 451 en Render*\n\n"
-                    f"• *{EXCHANGE_ID.upper()}* bloquea las IPs de servidores cloud en EE.UU.\n"
-                    "• *Solución Automática*: Conectado a *BYBIT Testnet* para operar sin interrupción.\n"
-                    "• *Recomendación*: En las variables de Render puedes fijar `EXCHANGE_ID=bybit`."
+                    "ℹ️ *Aviso de Compatibilidad Cloud (Render EE.UU.)*\n\n"
+                    f"• {EXCHANGE_ID.upper()} bloquea las IPs de servidores cloud en EE.UU. (Error 403/451 CloudFront).\n"
+                    "• *Solución Automática*: El bot ha activado cotizaciones en tiempo real globales de KRAKEN sin bloqueos.\n"
+                    "• *Para operar en Bybit/Binance con dinero real*: Cambia la Región de tu servicio en Render a **Frankfurt (Europa)**."
                 )
                 send_telegram(notice_msg)
-                EXCHANGE_ID = "bybit"
-                exchange = ccxt.bybit({
-                    'enableRateLimit': True,
-                    'options': {'defaultType': 'future' if LEVERAGE > 1 else 'spot'}
-                })
-                if IS_TESTNET and hasattr(exchange, 'set_sandbox_mode'):
-                    exchange.set_sandbox_mode(True)
-                exchange.load_markets()
+                EXCHANGE_ID = "kraken"
+                try:
+                    exchange = ccxt.kraken({'enableRateLimit': True})
+                    exchange.load_markets()
+                except Exception as k_err:
+                    logging.warning(f"Aviso Kraken CCXT: {k_err}. Usando feed directo.")
+                    exchange = None
             else:
                 raise load_err
         
         # Ajustar apalancamiento si es futuros
-        if LEVERAGE > 1 and hasattr(exchange, 'set_leverage'):
+        if exchange and LEVERAGE > 1 and hasattr(exchange, 'set_leverage'):
             try:
                 exchange.set_leverage(LEVERAGE, SYMBOL)
                 logging.info(f"Apalancamiento fijado a {LEVERAGE}x para {SYMBOL}")
@@ -117,17 +116,18 @@ def init_exchange():
                 logging.warning(f"Aviso apalancamiento: {lev_err}")
 
         # Comprobar balance con respaldo seguro
-        try:
-            balance = exchange.fetch_balance()
-            initial_usdt_balance = balance.get('USDT', {}).get('free', 1000.0)
-        except Exception as bal_err:
-            logging.warning(f"Aviso balance: {bal_err}. Usando saldo inicial simulado.")
-            initial_usdt_balance = 10000.0
+        initial_usdt_balance = 10000.0
+        if exchange and API_KEY and "tu_api" not in API_KEY and hasattr(exchange, 'fetch_balance'):
+            try:
+                balance = exchange.fetch_balance()
+                initial_usdt_balance = balance.get('USDT', {}).get('free', 10000.0)
+            except Exception as bal_err:
+                logging.warning(f"Aviso balance: {bal_err}. Usando saldo de trading inicial: $10,000.00 USDT.")
         
-        status_mode = "TESTNET" if IS_TESTNET else "REAL"
+        status_mode = "TESTNET / KRAKEN LIVE FEED" if is_cloud_blocked or IS_TESTNET else "REAL"
         msg_start = (
             "🚀 *Bot Cripto Iniciado con Éxito*\n\n"
-            f"• Exchange: *{EXCHANGE_ID.upper()}* ({status_mode})\n"
+            f"• Feed Mercado: *{EXCHANGE_ID.upper()}* ({status_mode})\n"
             f"• Par: *{SYMBOL}* | Marco: *{TIMEFRAME}*\n"
             f"• Saldo USDT: *${initial_usdt_balance:,.2f}*\n"
             f"• Apalancamiento: *{LEVERAGE}x*\n"
@@ -141,9 +141,28 @@ def init_exchange():
         return False
 
 def calculate_technical_signals():
-    """Calcula indicadores técnicos (RSI, EMA) usando velas OHLCV directas del exchange"""
+    """Calcula indicadores técnicos (RSI, EMA) usando velas OHLCV directas del exchange o feed público"""
     try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+        ohlcv = None
+        if exchange and hasattr(exchange, 'fetch_ohlcv'):
+            try:
+                ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+            except Exception as ohlcv_err:
+                logging.warning(f"Aviso fetch_ohlcv CCXT: {ohlcv_err}. Usando feed público de respaldo...")
+
+        # Respaldo de alta disponibilidad directo a Kraken público (sin bloqueos de CloudFront)
+        if not ohlcv or len(ohlcv) < 20:
+            pair_code = "XBTUSDT" if "BTC" in SYMBOL.upper() else "ETHUSDT" if "ETH" in SYMBOL.upper() else "SOLUSDT"
+            url = f"https://api.kraken.com/0/public/OHLC?pair={pair_code}&interval=15"
+            resp = requests.get(url, timeout=10, headers={'User-Agent': 'CryptoBot/1.0'}).json()
+            if 'result' in resp:
+                key = [k for k in resp['result'].keys() if k != 'last'][0]
+                raw_candles = resp['result'][key]
+                ohlcv = [[int(c[0]) * 1000, float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[6])] for c in raw_candles[-100:]]
+
+        if not ohlcv or len(ohlcv) < 20:
+            return None
+
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         
         # Calcular EMA 20 y EMA 50
@@ -160,11 +179,8 @@ def calculate_technical_signals():
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # Condiciones de Compra / Long
-        buy_signal = (prev['ema_fast'] <= prev['ema_slow']) and (last['ema_fast'] > last['ema_slow']) and (last['rsi'] > 50)
-        
-        # Condiciones de Venta / Short
-        sell_signal = (prev['ema_fast'] >= prev['ema_slow']) and (last['ema_fast'] < last['ema_slow']) and (last['rsi'] < 50)
+        buy_signal = bool((prev['ema_fast'] <= prev['ema_slow']) and (last['ema_fast'] > last['ema_slow']) and (last['rsi'] > 50))
+        sell_signal = bool((prev['ema_fast'] >= prev['ema_slow']) and (last['ema_fast'] < last['ema_slow']) and (last['rsi'] < 50))
         
         return {
             'buy': buy_signal,
