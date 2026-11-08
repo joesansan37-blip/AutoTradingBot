@@ -1,9 +1,8 @@
 """Paper-only Solana (SOL) perpetual-futures strategy runner.
 
-This application uses public price candles and a local simulated ledger. It does not
-connect a wallet, use exchange credentials, or submit any real order. 'Solana futures'
-are simulated from SOL/USDT prices; Solana itself does not provide a native perpetual
-futures venue through this app.
+Uses public spot-market candles as a price feed and a local paper ledger. It does not
+connect a wallet, read exchange credentials, or submit real orders. SOL futures are
+simulated from SOL/USDT prices; Solana itself is not a futures venue.
 """
 
 import logging
@@ -13,20 +12,19 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import ccxt
-import pandas as pd
 import requests
 
 from paper_futures import PaperFutures
+from strategies import STRATEGIES, signal_from_candles
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# Deliberately fail closed: this version has no live-order implementation.
 if os.getenv("EXECUTION_MODE", "paper").strip().lower() != "paper":
     raise RuntimeError("Only EXECUTION_MODE=paper is supported; live trading is not implemented.")
 
 SYMBOL = os.getenv("TRADING_SYMBOL", "SOL/USDT").strip()
 TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
 DATA_EXCHANGE = os.getenv("DATA_EXCHANGE", "kraken").strip().lower()
+STRATEGY = os.getenv("STRATEGY", "ema_trend").strip().lower()
 LEVERAGE = int(os.getenv("LEVERAGE", "2"))
 ORDER_MARGIN_USDT = float(os.getenv("ORDER_MARGIN_USDT", "25"))
 STARTING_BALANCE = float(os.getenv("PAPER_STARTING_BALANCE_USDT", "500"))
@@ -40,11 +38,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 if SYMBOL != "SOL/USDT":
-    raise ValueError("This initial paper simulator is limited to TRADING_SYMBOL=SOL/USDT")
-if LEVERAGE < 1 or LEVERAGE > 10:
-    raise ValueError("Set LEVERAGE between 1 and 10 for paper simulation")
-if min(ORDER_MARGIN_USDT, STARTING_BALANCE, MAX_DAILY_LOSS) <= 0:
-    raise ValueError("Paper balance, order margin, and daily loss limit must be positive")
+    raise ValueError("This simulator is limited to TRADING_SYMBOL=SOL/USDT")
+if STRATEGY not in STRATEGIES:
+    raise ValueError(f"STRATEGY must be one of: {', '.join(STRATEGIES)}")
+if not 1 <= LEVERAGE <= 10:
+    raise ValueError("Set LEVERAGE between 1 and 10")
+if min(ORDER_MARGIN_USDT, STARTING_BALANCE, MAX_DAILY_LOSS) <= 0 or SCAN_SECONDS < 1:
+    raise ValueError("Balance, margin, daily loss limit and scan interval must be positive")
 if not 0 < PAPER_FEE_RATE < 0.01:
     raise ValueError("PAPER_FEE_RATE must be between 0 and 0.01")
 
@@ -70,8 +70,8 @@ def telegram_send(text, markup=None, chat_id=None):
                                  json=payload, timeout=8)
         response.raise_for_status()
         return response.json().get("ok", False)
-    except Exception as exc:
-        logging.error("Telegram send failed: %s", exc)
+    except Exception:
+        logging.exception("Telegram send failed")
         return False
 
 
@@ -86,15 +86,15 @@ def telegram_edit(chat_id, message_id, text, markup=None):
                                  json=payload, timeout=8)
         response.raise_for_status()
         return response.json().get("ok", False)
-    except Exception as exc:
-        logging.error("Telegram edit failed: %s", exc)
+    except Exception:
+        logging.exception("Telegram message edit failed")
         return False
 
 
 def menu():
     return {"inline_keyboard": [
         [{"text": "💰 Balance paper", "callback_data": "balance"},
-         {"text": "📈 Posición", "callback_data": "positions"}],
+         {"text": "📈 Posiciones", "callback_data": "positions"}],
         [{"text": "📡 Radar SOL", "callback_data": "radar"},
          {"text": "⏸ Pausar", "callback_data": "pause"}],
         [{"text": "▶ Reanudar", "callback_data": "resume"},
@@ -115,33 +115,18 @@ def create_market_data_client():
 
 def fetch_candles():
     candles = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
-    if not candles or len(candles) < 55:
+    if not candles or len(candles) < 60:
         raise RuntimeError("Not enough candles to calculate the strategy")
     return candles
 
 
-def signal_from_candles(candles):
-    # Ignore the still-forming candle to avoid repeated/intrabar crossover signals.
-    df = pd.DataFrame(candles[:-1], columns=["time", "open", "high", "low", "close", "volume"])
-    df["fast"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["slow"] = df["close"].ewm(span=50, adjust=False).mean()
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    df["rsi"] = 100 - 100 / (1 + gain / (loss + 1e-9))
-    prev, last = df.iloc[-2], df.iloc[-1]
-    side = None
-    if prev.fast <= prev.slow and last.fast > last.slow and last.rsi > 50:
-        side = "LONG"
-    elif prev.fast >= prev.slow and last.fast < last.slow and last.rsi < 50:
-        side = "SHORT"
-    return {"side": side, "price": float(last.close), "high": float(last.high),
-            "low": float(last.low), "rsi": float(last.rsi)}
+def make_signal(candles):
+    return signal_from_candles(candles, STRATEGY)
 
 
 def process_market():
     candles = fetch_candles()
-    signal = signal_from_candles(candles)
+    signal = make_signal(candles)
     ticker = exchange.fetch_ticker(SYMBOL)
     mark = float(ticker.get("last") or signal["price"])
     closed = account.check_exit(SYMBOL, signal["high"], signal["low"], mark)
@@ -151,9 +136,9 @@ def process_market():
     if trading_active and signal["side"] and SYMBOL not in account.state["positions"]:
         try:
             position = account.open_position(SYMBOL, signal["side"], mark, ORDER_MARGIN_USDT)
-            telegram_send(f"🧪 APERTURA PAPER {position['side']} {SYMBOL}\n"
-                          f"Entrada: {mark:.4f} | Margen: {ORDER_MARGIN_USDT:.2f} USDT | "
-                          f"Notional simulado: {position['notional']:.2f} USDT ({LEVERAGE}x)\n"
+            telegram_send(f"🧪 APERTURA PAPER {position['side']} {SYMBOL} | estrategia: {STRATEGY}\n"
+                          f"Entrada: {mark:.4f} | margen: {ORDER_MARGIN_USDT:.2f} USDT | "
+                          f"nocional: {position['notional']:.2f} USDT ({LEVERAGE}x)\n"
                           f"SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}\n"
                           "Solo simulación; no se envió ninguna orden real.", menu())
         except ValueError as exc:
@@ -165,89 +150,97 @@ def snapshot_text(mark=None):
     prices = {SYMBOL: mark} if mark else {}
     snap = account.snapshot(prices)
     return ("🧪 CUENTA PAPER (sin dinero real)\n"
+            f"Estrategia: {STRATEGY}\n"
             f"Equity: {snap['equity']:.2f} USDT | Disponible: {snap['available']:.2f} USDT\n"
             f"PnL flotante: {snap['unrealized_pnl']:.2f} USDT | "
             f"PnL realizado hoy: {snap['daily_realized']:.2f} USDT\n"
             f"Operaciones cerradas: {snap['closed_trades']} | Apalancamiento simulado: {LEVERAGE}x")
 
 
+def positions_text():
+    positions = account.snapshot()["positions"]
+    if not positions:
+        return "Sin posiciones paper abiertas."
+    return "\n".join(f"{p['side']} {p['symbol']} entrada {p['entry']:.4f}, "
+                     f"qty {p['quantity']:.6f}, SL {p['stop_loss']:.4f}, TP {p['take_profit']:.4f}"
+                     for p in positions)
+
+
+def panic_close():
+    mark = exchange.fetch_ticker(SYMBOL).get("last") if exchange else None
+    return account.close_all({SYMBOL: float(mark)}) if mark else []
+
+
 def handle_update(update):
     global trading_active
     message = update.get("message") or {}
     callback = update.get("callback_query")
-    sender = (message.get("chat") or {}).get("id") if message else None
-    if callback:
-        sender = ((callback.get("message") or {}).get("chat") or {}).get("id")
+    source_message = callback.get("message", {}) if callback else message
+    sender = (source_message.get("chat") or {}).get("id")
     if TELEGRAM_CHAT_ID and str(sender) != TELEGRAM_CHAT_ID:
         logging.warning("Ignoring Telegram update from unauthorized chat")
         return
+
     if message:
         text = (message.get("text") or "").strip().lower()
         if text.startswith(("/start", "/menu", "/help")):
-            telegram_send("Simulador de futuros perpetuos de SOL en modo PAPER. "
-                          "No se conecta a Phantom ni envía órdenes reales.\n"
+            telegram_send(f"🧪 SOL futures PAPER only. Strategy: {STRATEGY}. No live orders.\n"
                           "/balance, /positions, /radar, /pause, /resume, /panic", menu(), sender)
         elif text.startswith(("/balance", "/saldo")):
             telegram_send(snapshot_text(), menu(), sender)
         elif text.startswith("/positions"):
-            positions = account.snapshot()["positions"]
-            text_out = "Sin posiciones paper abiertas." if not positions else "\n".join(
-                f"{p['side']} {p['symbol']} entrada {p['entry']:.4f}, qty {p['quantity']:.6f}, "
-                f"SL {p['stop_loss']:.4f}, TP {p['take_profit']:.4f}" for p in positions)
-            telegram_send(text_out, menu(), sender)
+            telegram_send(positions_text(), menu(), sender)
         elif text.startswith("/pause"):
             trading_active = False
-            telegram_send("⏸ Simulación pausada; las posiciones siguen monitorizándose.", menu(), sender)
+            telegram_send("⏸ Simulación pausada; SL/TP siguen monitorizándose.", menu(), sender)
         elif text.startswith("/resume"):
             trading_active = True
             telegram_send("▶ Simulación reanudada.", menu(), sender)
         elif text.startswith("/panic"):
-            mark = exchange.fetch_ticker(SYMBOL).get("last") if exchange else None
-            closed = account.close_all({SYMBOL: float(mark)}) if mark else []
+            closed = panic_close()
             telegram_send(f"Cierre paper completado: {len(closed)} posición(es). No hubo órdenes reales.", menu(), sender)
         elif text.startswith("/radar"):
             try:
-                sig = signal_from_candles(fetch_candles())
-                telegram_send(f"Radar {SYMBOL}: {sig['price']:.4f} USDT, RSI {sig['rsi']:.1f}, "
-                              f"señal: {sig['side'] or 'sin cruce'} (paper)", menu(), sender)
+                sig = make_signal(fetch_candles())
+                telegram_send(f"Radar {SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT, "
+                              f"RSI {sig['rsi']:.1f}, señal: {sig['side'] or 'sin señal'} (paper)", menu(), sender)
             except Exception as exc:
                 telegram_send(f"No se pudo obtener el radar: {exc}", menu(), sender)
-    elif callback:
-        cq = callback
+        return
+
+    if not callback:
+        return
+    cq = callback
+    if TELEGRAM_TOKEN:
         try:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
-                          json={"callback_query_id": cq.get("id")}, timeout=5)
+                          json={"callback_query_id": cq.get("id")}, timeout=5).raise_for_status()
         except Exception:
-            pass
-        chat = (cq.get("message") or {}).get("chat") or {}
-        message_id = (cq.get("message") or {}).get("message_id")
-        data = cq.get("data")
-        if data == "balance":
-            text_out = snapshot_text()
-        elif data == "positions":
-            positions = account.snapshot()["positions"]
-            text_out = "Sin posiciones paper abiertas." if not positions else "\n".join(
-                f"{p['side']} {p['symbol']} entrada {p['entry']:.4f}, SL {p['stop_loss']:.4f}, "
-                f"TP {p['take_profit']:.4f}" for p in positions)
-        elif data == "radar":
-            try:
-                sig = signal_from_candles(fetch_candles())
-                text_out = f"{SYMBOL}: {sig['price']:.4f} USDT | RSI {sig['rsi']:.1f} | {sig['side'] or 'sin señal'}"
-            except Exception as exc:
-                text_out = f"Radar no disponible: {exc}"
-        elif data == "pause":
-            trading_active = False
-            text_out = "Simulación pausada; SL/TP siguen monitorizándose."
-        elif data == "resume":
-            trading_active = True
-            text_out = "Simulación reanudada."
-        elif data == "panic":
-            mark = exchange.fetch_ticker(SYMBOL).get("last") if exchange else None
-            closed = account.close_all({SYMBOL: float(mark)}) if mark else []
-            text_out = f"Cierre paper: {len(closed)} posición(es). No hubo órdenes reales."
-        else:
-            text_out = "Acción no reconocida."
-        telegram_edit(chat.get("id"), message_id, text_out, menu())
+            logging.exception("Could not acknowledge Telegram button")
+    data = cq.get("data")
+    if data == "balance":
+        text_out = snapshot_text()
+    elif data == "positions":
+        text_out = positions_text()
+    elif data == "radar":
+        try:
+            sig = make_signal(fetch_candles())
+            text_out = f"{SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT | RSI {sig['rsi']:.1f} | " \
+                       f"{sig['side'] or 'sin señal'} (paper)"
+        except Exception as exc:
+            text_out = f"Radar no disponible: {exc}"
+    elif data == "pause":
+        trading_active = False
+        text_out = "Simulación pausada; SL/TP siguen monitorizándose."
+    elif data == "resume":
+        trading_active = True
+        text_out = "Simulación reanudada."
+    elif data == "panic":
+        closed = panic_close()
+        text_out = f"Cierre paper: {len(closed)} posición(es). No hubo órdenes reales."
+    else:
+        text_out = "Acción no reconocida."
+    telegram_edit(sender, source_message.get("message_id"), text_out, menu())
 
 
 def telegram_worker():
@@ -300,12 +293,13 @@ def main():
         except Exception:
             logging.exception("Unable to initialize public market-data client; retrying in 30s")
             time.sleep(30)
-    telegram_send("🧪 Simulador PAPER iniciado para SOL/USDT. Solo usa datos públicos; "
-                  "no se envían órdenes reales. /start para controles.", menu())
+    telegram_send(f"🧪 Simulador PAPER iniciado para {SYMBOL}. Estrategia: {STRATEGY}. "
+                  "Solo usa datos públicos; no se envían órdenes reales. /start para controles.", menu())
     while True:
         try:
             signal, mark = process_market()
-            logging.info("SOL mark=%.4f signal=%s active=%s", mark, signal["side"], trading_active)
+            logging.info("%s mark=%.4f strategy=%s signal=%s active=%s",
+                         SYMBOL, mark, STRATEGY, signal["side"], trading_active)
             time.sleep(SCAN_SECONDS)
         except Exception:
             logging.exception("Paper strategy cycle failed")
