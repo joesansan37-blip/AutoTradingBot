@@ -15,6 +15,14 @@ import requests
 import pandas as pd
 import numpy as np
 
+from safe_solana import (
+    start_deposit_monitor,
+    set_paper_trading,
+    paper_trading_enabled,
+    process_paper_signal,
+    manual_withdrawal_notice,
+)
+
 # Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
@@ -153,6 +161,7 @@ def answer_callback_query(cq_id: str):
 
 
 def get_main_menu_markup():
+    paper_state = "ON" if paper_trading_enabled() else "OFF"
     return {
         "inline_keyboard": [
             [{"text": "💰 Saldo & Billetera", "callback_data": "balance"},
@@ -165,8 +174,10 @@ def get_main_menu_markup():
              {"text": "🚀 Invertir Capital", "callback_data": "invest"}],
             [{"text": "🌐 Configurar Proxy", "callback_data": "proxy_info"},
              {"text": "🚨 Panic Close", "callback_data": "panic"}],
-            [{"text": "⏸️ Pausar", "callback_data": "pause"},
-             {"text": "▶️ Reanudar", "callback_data": "resume"}]
+            [{"text": f"🧪 Paper Trading: {paper_state}", "callback_data": "paper_toggle"},
+             {"text": "⏸️ Pausar", "callback_data": "pause"}],
+            [{"text": "▶️ Reanudar", "callback_data": "resume"},
+             {"text": "🔐 Retiros Manuales", "callback_data": "manual_withdrawal"}]
         ]
     }
 
@@ -183,6 +194,12 @@ def get_exchange_menu_markup():
             [{"text": "🔙 Menú Principal", "callback_data": "back_main"}]
         ]
     }
+
+
+def toggle_paper_trading():
+    current = paper_trading_enabled()
+    set_paper_trading(not current)
+    return not current
 
 
 # --- CONTROLADOR TELEGRAM EN SEGUNDO PLANO ---
@@ -217,6 +234,17 @@ def handle_telegram_update(update: dict):
                     "• El bot opera en Jupiter DEX y Raydium de forma automática."
                 )
                 send_telegram(p_text, chat_id=chat_id, reply_markup=get_main_menu_markup())
+
+            elif cmd.startswith("/paper_on") or cmd.startswith("/paper"):
+                set_paper_trading(True)
+                send_telegram("🧪 Trading simulado ACTIVADO. Las aperturas/cierres son en memoria y no mueven fondos reales.", chat_id=chat_id, reply_markup=get_main_menu_markup())
+
+            elif cmd.startswith("/paper_off"):
+                set_paper_trading(False)
+                send_telegram("🧪 Trading simulado DESACTIVADO.", chat_id=chat_id, reply_markup=get_main_menu_markup())
+
+            elif cmd.startswith("/withdraw") or cmd.startswith("/retiro"):
+                send_telegram(manual_withdrawal_notice(), chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/exchange"):
                 parts = text.split()
@@ -344,8 +372,10 @@ def handle_telegram_update(update: dict):
                 edit_telegram_message(chat_id, msg_id, d_msg, reply_markup=get_main_menu_markup())
 
             elif data == "withdraw":
-                w_msg = "📤 Retiro: usa tu wallet de destino y confirma la red correcta antes de enviar fondos."
-                edit_telegram_message(chat_id, msg_id, w_msg, reply_markup=get_main_menu_markup())
+                edit_telegram_message(chat_id, msg_id, manual_withdrawal_notice(), reply_markup=get_main_menu_markup())
+
+            elif data == "manual_withdrawal":
+                edit_telegram_message(chat_id, msg_id, manual_withdrawal_notice(), reply_markup=get_main_menu_markup())
 
             elif data == "invest":
                 i_msg = f"🚀 Invertir Capital: el bot usa {WALLET_INVESTED_USDT:,.2f} USDT por ciclo de trading con tamaño por orden {ORDER_SIZE_USDT:.2f} USDT."
@@ -354,6 +384,14 @@ def handle_telegram_update(update: dict):
             elif data == "proxy_info":
                 p_msg = "🌐 Configurar Proxy: define CRYPTO_PROXY_URL con un proxy HTTP/HTTPS público o usa Phantom/Phantom DEX para evitar bloqueos geográficos."
                 edit_telegram_message(chat_id, msg_id, p_msg, reply_markup=get_main_menu_markup())
+
+            elif data == "paper_toggle":
+                enabled = toggle_paper_trading()
+                if enabled:
+                    msg = "🧪 Paper Trading ACTIVADO: el bot simula aperturas y cierres en memoria, sin mover fondos reales."
+                else:
+                    msg = "🧪 Paper Trading DESACTIVADO."
+                edit_telegram_message(chat_id, msg_id, msg, reply_markup=get_main_menu_markup())
 
             elif data.startswith("set_exchange_"):
                 target = data.replace("set_exchange_", "").lower().strip()
@@ -377,7 +415,7 @@ def handle_telegram_update(update: dict):
                     "👻 MODO PHANTOM WALLET / SOLANA DEX\n\n"
                     "• Dirección de Depósito:\n"
                     "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
-                    "• Envía SOL o USDT-SPL desde tu app Phantom.\n"
+                    "�� Envía SOL o USDT-SPL desde tu app Phantom.\n"
                     "• Sin API Keys ni verificaciones de identidad."
                 )
                 edit_telegram_message(chat_id, msg_id, p_text, reply_markup=get_exchange_menu_markup())
@@ -424,6 +462,12 @@ def telegram_polling_worker():
 
 
 threading.Thread(target=telegram_polling_worker, daemon=True).start()
+
+# Solana monitor: read-only, enabled when a public wallet address is configured.
+try:
+    start_deposit_monitor(send_telegram)
+except Exception as e:
+    logging.warning(f"Solana deposit monitor no pudo arrancar: {e}")
 
 # --- CONECTOR DE EXCHANGES (CCXT / PHANTOM) ---
 def build_exchange_client(exchange_name: str, proxy_url: str = None):
@@ -648,6 +692,7 @@ def execute_crypto_order(symbol: str, side: str, current_price: float):
 
 def close_all_crypto_positions():
     active_positions.clear()
+    set_paper_trading(False)
     send_telegram("🔒 Todas las posiciones han sido cerradas de emergencia.")
 
 
@@ -680,7 +725,9 @@ def run_crypto_loop():
                     if sig:
                         cycle_results.append(sig)
                         price = sig['close']
-                        if symbol not in active_positions:
+                        if paper_trading_enabled():
+                            process_paper_signal(sig, ORDER_SIZE_USDT, STOP_LOSS_PCT, TAKE_PROFIT_PCT, send_telegram)
+                        elif symbol not in active_positions:
                             if sig['buy']:
                                 execute_crypto_order(symbol, "BUY", price)
                             elif sig['sell']:
