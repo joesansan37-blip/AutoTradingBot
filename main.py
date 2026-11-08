@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 
 STATE_FILE = "trading_state.json"
 
+
 def read_dynamic_state():
     if os.path.exists(STATE_FILE):
         try:
@@ -32,6 +33,7 @@ def read_dynamic_state():
         "proxy_url": os.getenv("CRYPTO_PROXY_URL", "").strip()
     }
 
+
 def save_dynamic_state(exchange_id: str, proxy_url: str = None):
     cur = read_dynamic_state()
     cur["exchange_id"] = exchange_id.lower().strip()
@@ -43,6 +45,7 @@ def save_dynamic_state(exchange_id: str, proxy_url: str = None):
     except Exception as e:
         logging.error(f"Error guardando estado: {e}")
 
+
 # --- SERVIDOR WEB LIGERO PARA RENDER (100% GRATIS 24/7) ---
 class RenderHealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -51,14 +54,17 @@ class RenderHealthServer(BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/plain; charset=utf-8')
         self.end_headers()
         self.wfile.write(f"Bot Cripto 24/7 activo en Render! Exchange actual: {state.get('exchange_id', 'phantom').upper()}".encode('utf-8'))
+
     def log_message(self, format, *args):
         pass
+
 
 def run_health_check_service():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), RenderHealthServer)
     logging.info(f"Servidor de Salud Render activo en el puerto {port}")
     server.serve_forever()
+
 
 threading.Thread(target=run_health_check_service, daemon=True).start()
 
@@ -88,47 +94,53 @@ initial_usdt_balance = WALLET_INVESTED_USDT
 active_positions = {}
 cycle_counter = 0
 
-def send_telegram(message: str, reply_markup: dict = None):
+
+def send_telegram(message: str, chat_id: str = None, reply_markup: dict = None):
     if not TELEGRAM_BOT_TOKEN or "TU_TELEGRAM" in TELEGRAM_BOT_TOKEN:
         logging.info(f"[TELEGRAM SIMULADO]: {message}")
         return False
-    chat_id = TELEGRAM_CHAT_ID
-    if not chat_id:
+    target_chat_id = str(chat_id or TELEGRAM_CHAT_ID or "").strip()
+    if not target_chat_id:
+        logging.warning("Telegram: chat_id no definido. Debes usar el chat del usuario o TELEGRAM_CHAT_ID.")
         return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": target_chat_id, "text": message}
     if reply_markup:
         payload["reply_markup"] = reply_markup
+
     try:
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code == 200:
             return True
-        else:
-            if "can't parse entities" in r.text.lower() or "bad request" in r.text.lower():
-                payload.pop("parse_mode", None)
-                r_retry = requests.post(url, json=payload, timeout=5)
-                return r_retry.status_code == 200
-            return False
+        if "bad request" in r.text.lower() or "can't parse entities" in r.text.lower():
+            payload.pop("parse_mode", None)
+            r_retry = requests.post(url, json=payload, timeout=5)
+            return r_retry.status_code == 200
+        logging.warning(f"Telegram send failed: {r.status_code} {r.text[:300]}")
+        return False
     except Exception as e:
         logging.error(f"Excepción enviando mensaje a Telegram: {e}")
         return False
+
 
 def edit_telegram_message(target_chat_id, message_id: int, text: str, reply_markup: dict = None):
     token = TELEGRAM_BOT_TOKEN
     if not token:
         return False
     url = f"https://api.telegram.org/bot{token}/editMessageText"
-    payload = {"chat_id": target_chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": target_chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
-            payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=5)
-        return True
-    except Exception:
+            logging.warning(f"Telegram edit failed: {r.status_code} {r.text[:300]}")
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Error editando mensaje Telegram: {e}")
         return False
+
 
 def answer_callback_query(cq_id: str):
     token = TELEGRAM_BOT_TOKEN
@@ -138,6 +150,7 @@ def answer_callback_query(cq_id: str):
         requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery", json={"callback_query_id": cq_id}, timeout=3)
     except Exception:
         pass
+
 
 def get_main_menu_markup():
     return {
@@ -157,6 +170,7 @@ def get_main_menu_markup():
         ]
     }
 
+
 def get_exchange_menu_markup():
     return {
         "inline_keyboard": [
@@ -170,6 +184,7 @@ def get_exchange_menu_markup():
         ]
     }
 
+
 # --- CONTROLADOR TELEGRAM EN SEGUNDO PLANO ---
 def handle_telegram_update(update: dict):
     global is_trading_active, EXCHANGE_ID
@@ -177,31 +192,31 @@ def handle_telegram_update(update: dict):
         if "message" in update:
             msg = update["message"]
             text = msg.get("text", "").strip()
-            sender_chat_id = str(msg.get("chat", {}).get("id"))
+            chat_id = str(msg.get("chat", {}).get("id") or "").strip()
             cmd = text.lower()
 
             if cmd.startswith("/start") or cmd.startswith("/menu"):
                 welcome = (
-                    "🤖 *Panel de Control Cripto & Divisas (100% Sin MetaTrader)*\n\n"
-                    f"• Modo Activo: *{EXCHANGE_ID.upper()}*\n"
-                    f"• Pares: *{', '.join(SYMBOLS[:4])}...*\n"
-                    f"• Capital: *{WALLET_INVESTED_USDT:,.2f} USDT*\n\n"
+                    "🤖 Panel de Control Cripto & Divisas (100% Sin MetaTrader)\n\n"
+                    f"• Modo Activo: {EXCHANGE_ID.upper()}\n"
+                    f"• Pares: {', '.join(SYMBOLS[:4])}...\n"
+                    f"• Capital: {WALLET_INVESTED_USDT:,.2f} USDT\n\n"
                     "Selecciona una opción del menú interactivo:"
                 )
-                send_telegram(welcome, reply_markup=get_main_menu_markup())
+                send_telegram(welcome, chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/phantom") or cmd.startswith("/solana"):
                 save_dynamic_state("phantom")
                 init_exchange("phantom")
                 p_text = (
-                    "👻 *MODO PHANTOM WALLET / SOLANA DEX ACTIVADO*\n\n"
+                    "👻 MODO PHANTOM WALLET / SOLANA DEX ACTIVADO\n\n"
                     "¡Ya puedes operar fondos reales sin API Keys ni KYC!\n\n"
-                    "• *Dirección de Depósito Solana*:\n"
+                    "• Dirección de Depósito Solana:\n"
                     "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
                     "• Envía SOL o USDT-SPL desde tu app Phantom en tu móvil.\n"
                     "• El bot opera en Jupiter DEX y Raydium de forma automática."
                 )
-                send_telegram(p_text, reply_markup=get_main_menu_markup())
+                send_telegram(p_text, chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/exchange"):
                 parts = text.split()
@@ -210,27 +225,27 @@ def handle_telegram_update(update: dict):
                     if target_ex in ["phantom", "solana", "bybit", "binance", "okx", "bitget", "kraken"]:
                         save_dynamic_state(target_ex)
                         init_exchange(target_ex)
-                        send_telegram(f"✅ *Exchange cambiado exitosamente a {target_ex.upper()}*. Motor actualizado.", reply_markup=get_main_menu_markup())
+                        send_telegram(f"✅ Exchange cambiado exitosamente a {target_ex.upper()}. Motor actualizado.", chat_id=chat_id, reply_markup=get_main_menu_markup())
                     else:
-                        send_telegram(f"⚠️ Exchange desconocido '{target_ex}'. Opciones: phantom, bybit, binance, okx, bitget, kraken.", reply_markup=get_exchange_menu_markup())
+                        send_telegram(f"⚠️ Exchange desconocido '{target_ex}'. Opciones: phantom, bybit, binance, okx, bitget, kraken.", chat_id=chat_id, reply_markup=get_exchange_menu_markup())
                 else:
                     menu_msg = (
-                        "💱 *Selector de Exchanges & DEX (Phantom / Solana)*\n\n"
-                        f"• Exchange actual: *{EXCHANGE_ID.upper()}*\n"
+                        "💱 Selector de Exchanges & DEX (Phantom / Solana)\n\n"
+                        f"• Exchange actual: {EXCHANGE_ID.upper()}\n"
                         "Selecciona uno tocando los botones abajo:"
                     )
-                    send_telegram(menu_msg, reply_markup=get_exchange_menu_markup())
+                    send_telegram(menu_msg, chat_id=chat_id, reply_markup=get_exchange_menu_markup())
 
             elif cmd.startswith("/balance") or cmd.startswith("/saldo") or cmd.startswith("/wallet"):
                 bal_msg = (
-                    f"💰 *Balance de tu Cuenta Cripto [{EXCHANGE_ID.upper()}]:*\n\n"
-                    f"• Saldo Disponible: *{initial_usdt_balance:,.2f} USDT*\n"
-                    "• Saldo Solana: *24.5 SOL* (~4,460 USDT)\n"
-                    "• Saldo Bitcoin: *0.152 BTC* (~10,412 USDT)\n"
-                    f"• Capital Asignado: *{WALLET_INVESTED_USDT:,.2f} USDT*\n"
-                    f"• Modo Activo: *{EXCHANGE_ID.upper()}* | Operativo 24/7"
+                    f"💰 Balance de tu Cuenta Cripto [{EXCHANGE_ID.upper()}]:\n\n"
+                    f"• Saldo Disponible: {initial_usdt_balance:,.2f} USDT\n"
+                    "• Saldo Solana: 24.5 SOL (~4,460 USDT)\n"
+                    "• Saldo Bitcoin: 0.152 BTC (~10,412 USDT)\n"
+                    f"• Capital Asignado: {WALLET_INVESTED_USDT:,.2f} USDT\n"
+                    f"• Modo Activo: {EXCHANGE_ID.upper()} | Operativo 24/7"
                 )
-                send_telegram(bal_msg, reply_markup=get_main_menu_markup())
+                send_telegram(bal_msg, chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/radar") or cmd.startswith("/scan"):
                 prices = []
@@ -238,60 +253,107 @@ def handle_telegram_update(update: dict):
                     sig = calculate_technical_signals(sym)
                     if sig:
                         status = "🟢 Alcista" if sig['rsi'] > 55 else "🔴 Bajista" if sig['rsi'] < 45 else "⚪ Neutral"
-                        prices.append(f"• *{sym}*: {sig['close']:,.2f} USDT | RSI: {sig['rsi']:.1f} ({status})")
-                r_text = f"📡 *Radar Multiactivo [{EXCHANGE_ID.upper()}]:*\n\n" + ("\n".join(prices) if prices else "Escaneando velas...")
-                send_telegram(r_text, reply_markup=get_main_menu_markup())
+                        prices.append(f"• {sym}: {sig['close']:,.2f} USDT | RSI: {sig['rsi']:.1f} ({status})")
+                r_text = f"📡 Radar Multiactivo [{EXCHANGE_ID.upper()}]:\n\n" + ("\n".join(prices) if prices else "Escaneando velas...")
+                send_telegram(r_text, chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/deposit") or cmd.startswith("/depositar"):
                 d_msg = (
-                    "📥 *Direcciones Oficiales de Depósito Cripto Real:*\n\n"
-                    "• *👻 Solana (SOL) & USDT-SPL (Phantom - 100% Sin API Keys ni KYC)*:\n"
+                    "📥 Direcciones Oficiales de Depósito Cripto Real:\n\n"
+                    "• 👻 Solana (SOL) & USDT-SPL (Phantom - 100% Sin API Keys ni KYC):\n"
                     "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
-                    "• *USDT (Tron TRC-20)*:\n"
+                    "• USDT (Tron TRC-20):\n"
                     "`TYj8rX9wQ7z2kLmNp1sTuV4wXyZaBcDeFg`\n\n"
-                    "• *USDT (BNB Chain BEP-20)*:\n"
+                    "• USDT (BNB Chain BEP-20):\n"
                     "`0x71C836642F4a41300d56bc0264FB4b97D6789e5B`\n\n"
-                    "• *Bitcoin (BTC)*:\n"
+                    "• Bitcoin (BTC):\n"
                     "`bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh`"
                 )
-                send_telegram(d_msg, reply_markup=get_main_menu_markup())
+                send_telegram(d_msg, chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/panic"):
                 close_all_crypto_positions()
-                send_telegram("🚨 *PANIC CLOSE EJECUTADO*: Todas las posiciones cerradas a precio de mercado.", reply_markup=get_main_menu_markup())
+                send_telegram("🚨 PANIC CLOSE EJECUTADO: Todas las posiciones cerradas a precio de mercado.", chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/pause"):
                 is_trading_active = False
-                send_telegram("⏸️ *Bot Cripto en Pausa*.", reply_markup=get_main_menu_markup())
+                send_telegram("⏸️ Bot Cripto en Pausa.", chat_id=chat_id, reply_markup=get_main_menu_markup())
 
             elif cmd.startswith("/resume"):
                 is_trading_active = True
-                send_telegram("▶️ *Bot Cripto Reanudado*.", reply_markup=get_main_menu_markup())
+                send_telegram("▶️ Bot Cripto Reanudado.", chat_id=chat_id, reply_markup=get_main_menu_markup())
 
         elif "callback_query" in update:
             cq = update["callback_query"]
             answer_callback_query(cq.get("id"))
             c_msg = cq.get("message", {})
-            chat_id = c_msg.get("chat", {}).get("id")
+            chat_id = str(c_msg.get("chat", {}).get("id") or "").strip()
             msg_id = c_msg.get("message_id")
             data = cq.get("data", "")
 
+            if not chat_id or msg_id is None:
+                logging.warning("Callback sin chat_id/message_id; ignorado.")
+                return
+
             if data == "balance":
                 bal_msg = (
-                    f"💰 *Balance [{EXCHANGE_ID.upper()}]:*\n\n"
-                    f"• Saldo Disponible: *{initial_usdt_balance:,.2f} USDT*\n"
-                    "• Saldo Solana: *24.5 SOL* (~4,460 USDT)\n"
-                    f"• Capital Asignado: *{WALLET_INVESTED_USDT:,.2f} USDT*"
+                    f"💰 Balance [{EXCHANGE_ID.upper()}]:\n\n"
+                    f"• Saldo Disponible: {initial_usdt_balance:,.2f} USDT\n"
+                    "• Saldo Solana: 24.5 SOL (~4,460 USDT)\n"
+                    f"• Capital Asignado: {WALLET_INVESTED_USDT:,.2f} USDT"
                 )
                 edit_telegram_message(chat_id, msg_id, bal_msg, reply_markup=get_main_menu_markup())
 
             elif data == "exchange_menu":
                 menu_msg = (
-                    "💱 *Selector de Exchanges & DEX (Phantom / Solana)*\n\n"
-                    f"• Modo Actual: *{EXCHANGE_ID.upper()}*\n"
+                    "💱 Selector de Exchanges & DEX (Phantom / Solana)\n\n"
+                    f"• Modo Actual: {EXCHANGE_ID.upper()}\n"
                     "Selecciona para cambiar al instante:"
                 )
                 edit_telegram_message(chat_id, msg_id, menu_msg, reply_markup=get_exchange_menu_markup())
+
+            elif data == "radar":
+                prices = []
+                for sym in SYMBOLS[:6]:
+                    sig = calculate_technical_signals(sym)
+                    if sig:
+                        status = "🟢 Alcista" if sig['rsi'] > 55 else "🔴 Bajista" if sig['rsi'] < 45 else "⚪ Neutral"
+                        prices.append(f"• {sym}: {sig['close']:,.2f} USDT | RSI: {sig['rsi']:.1f} ({status})")
+                r_text = f"📡 Radar Multiactivo [{EXCHANGE_ID.upper()}]:\n\n" + ("\n".join(prices) if prices else "Escaneando velas...")
+                edit_telegram_message(chat_id, msg_id, r_text, reply_markup=get_main_menu_markup())
+
+            elif data == "positions":
+                if active_positions:
+                    lines = ["📈 Posiciones Abiertas:\n"]
+                    for sym, entry in active_positions.items():
+                        side = entry.get('side', 'BUY')
+                        price = entry.get('entry', 0.0)
+                        lines.append(f"• {sym}: {side} @ {price:,.4f} USDT")
+                    edit_telegram_message(chat_id, msg_id, "\n".join(lines), reply_markup=get_main_menu_markup())
+                else:
+                    edit_telegram_message(chat_id, msg_id, "📈 No hay posiciones abiertas en este momento.", reply_markup=get_main_menu_markup())
+
+            elif data == "deposit":
+                d_msg = (
+                    "📥 Direcciones Oficiales de Depósito:\n\n"
+                    "• 👻 Solana (SOL) / USDT-SPL:\n"
+                    "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
+                    "• USDT TRC-20:\n"
+                    "`TYj8rX9wQ7z2kLmNp1sTuV4wXyZaBcDeFg`"
+                )
+                edit_telegram_message(chat_id, msg_id, d_msg, reply_markup=get_main_menu_markup())
+
+            elif data == "withdraw":
+                w_msg = "📤 Retiro: usa tu wallet de destino y confirma la red correcta antes de enviar fondos."
+                edit_telegram_message(chat_id, msg_id, w_msg, reply_markup=get_main_menu_markup())
+
+            elif data == "invest":
+                i_msg = f"🚀 Invertir Capital: el bot usa {WALLET_INVESTED_USDT:,.2f} USDT por ciclo de trading con tamaño por orden {ORDER_SIZE_USDT:.2f} USDT."
+                edit_telegram_message(chat_id, msg_id, i_msg, reply_markup=get_main_menu_markup())
+
+            elif data == "proxy_info":
+                p_msg = "🌐 Configurar Proxy: define CRYPTO_PROXY_URL con un proxy HTTP/HTTPS público o usa Phantom/Phantom DEX para evitar bloqueos geográficos."
+                edit_telegram_message(chat_id, msg_id, p_msg, reply_markup=get_main_menu_markup())
 
             elif data.startswith("set_exchange_"):
                 target = data.replace("set_exchange_", "").lower().strip()
@@ -299,20 +361,20 @@ def handle_telegram_update(update: dict):
                 init_exchange(target)
                 if target in ["phantom", "solana"]:
                     conf_text = (
-                        "👻 *Cambiado a MODO PHANTOM WALLET / SOLANA DEX*\n\n"
-                        "• Autenticación: *100% Sin API Keys ni KYC*\n"
-                        "• Protocolo: *Jupiter DEX & Raydium*\n"
+                        "👻 Cambiado a MODO PHANTOM WALLET / SOLANA DEX\n\n"
+                        "• Autenticación: 100% Sin API Keys ni KYC\n"
+                        "• Protocolo: Jupiter DEX & Raydium\n"
                         "• Dirección de Depósito Solana:\n"
                         "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
-                        "• Estado: *Sincronizado en caliente en Render.*"
+                        "• Estado: Sincronizado en caliente en Render."
                     )
                 else:
-                    conf_text = f"✅ *Exchange cambiado exitosamente a {target.upper()}*."
+                    conf_text = f"✅ Exchange cambiado exitosamente a {target.upper()}."
                 edit_telegram_message(chat_id, msg_id, conf_text, reply_markup=get_exchange_menu_markup())
 
             elif data == "phantom_info":
                 p_text = (
-                    "👻 *MODO PHANTOM WALLET / SOLANA DEX*\n\n"
+                    "👻 MODO PHANTOM WALLET / SOLANA DEX\n\n"
                     "• Dirección de Depósito:\n"
                     "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
                     "• Envía SOL o USDT-SPL desde tu app Phantom.\n"
@@ -321,22 +383,23 @@ def handle_telegram_update(update: dict):
                 edit_telegram_message(chat_id, msg_id, p_text, reply_markup=get_exchange_menu_markup())
 
             elif data == "back_main":
-                edit_telegram_message(chat_id, msg_id, "🤖 *Menú Principal:*", reply_markup=get_main_menu_markup())
+                edit_telegram_message(chat_id, msg_id, "🤖 Menú Principal:", reply_markup=get_main_menu_markup())
 
             elif data == "panic":
                 close_all_crypto_positions()
-                edit_telegram_message(chat_id, msg_id, "🚨 *PANIC CLOSE*: Posiciones liquidadas.", reply_markup=get_main_menu_markup())
+                edit_telegram_message(chat_id, msg_id, "🚨 PANIC CLOSE: Posiciones liquidadas.", reply_markup=get_main_menu_markup())
 
             elif data == "pause":
                 is_trading_active = False
-                edit_telegram_message(chat_id, msg_id, "⏸️ *Bot Cripto en Pausa*.", reply_markup=get_main_menu_markup())
+                edit_telegram_message(chat_id, msg_id, "⏸️ Bot Cripto en Pausa.", reply_markup=get_main_menu_markup())
 
             elif data == "resume":
                 is_trading_active = True
-                edit_telegram_message(chat_id, msg_id, "▶️ *Bot Cripto Reanudado*.", reply_markup=get_main_menu_markup())
+                edit_telegram_message(chat_id, msg_id, "▶️ Bot Cripto Reanudado.", reply_markup=get_main_menu_markup())
 
     except Exception as e:
         logging.error(f"Error procesando update de Telegram: {e}")
+
 
 def telegram_polling_worker():
     token = TELEGRAM_BOT_TOKEN
@@ -348,15 +411,17 @@ def telegram_polling_worker():
     while True:
         try:
             url = f"https://api.telegram.org/bot{token}/getUpdates"
-            params = {"offset": offset, "timeout": 20}
+            params = {"offset": offset, "timeout": 20, "allowed_updates": ["message", "callback_query"]}
             resp = requests.get(url, params=params, timeout=25).json()
             if resp.get("ok"):
                 for item in resp.get("result", []):
                     offset = item["update_id"] + 1
                     handle_telegram_update(item)
             time.sleep(0.5)
-        except Exception:
+        except Exception as e:
+            logging.error(f"Polling Telegram error: {e}")
             time.sleep(3)
+
 
 threading.Thread(target=telegram_polling_worker, daemon=True).start()
 
@@ -404,6 +469,7 @@ def build_exchange_client(exchange_name: str, proxy_url: str = None):
 
     return client
 
+
 def map_symbol_for_kraken(symbol: str) -> str:
     s = symbol.replace("/", "").replace("-", "").upper()
     if "BTC" in s:
@@ -415,6 +481,7 @@ def map_symbol_for_kraken(symbol: str) -> str:
     if "GBP" in s and "USDT" in s:
         return "GBPUSD"
     return s
+
 
 def init_exchange(force_exchange_id: str = None):
     global exchange, initial_usdt_balance, EXCHANGE_ID
@@ -428,17 +495,17 @@ def init_exchange(force_exchange_id: str = None):
         exchange = None
         logging.info("Conectado en MODO PHANTOM WALLET / SOLANA DEX (100% Sin API Key ni Secret Key).")
         msg_start = (
-            "🚀 *Bot Cripto Iniciado en MODO PHANTOM WALLET*\n\n"
-            "• Red: *Phantom Wallet (Solana DEX)*\n"
-            "• Autenticación: *100% Sin API Keys ni KYC (DeFi)*\n"
-            "• Protocolo: *Jupiter DEX Aggregator + Raydium*\n"
-            "• Feed de Precios: *Jupiter Price API & Kraken Global*\n"
+            "🚀 Bot Cripto Iniciado en MODO PHANTOM WALLET\n\n"
+            "• Red: Phantom Wallet (Solana DEX)\n"
+            "• Autenticación: 100% Sin API Keys ni KYC (DeFi)\n"
+            "• Protocolo: Jupiter DEX Aggregator + Raydium\n"
+            "• Feed de Precios: Jupiter Price API & Kraken Global\n"
             "• Dirección de Depósito Solana:\n"
             "`7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU`\n\n"
-            f"• Capital de Trading: *{WALLET_INVESTED_USDT:,.2f} USDT*\n"
-            f"• Tamaño por Orden: *{ORDER_SIZE_USDT} USDT*\n"
-            "• Comisiones por Trade: *< 0.001 USDT (Solana)*\n"
-            "• Control: *Telegram Bot 24/7 en Render*"
+            f"• Capital de Trading: {WALLET_INVESTED_USDT:,.2f} USDT\n"
+            f"• Tamaño por Orden: {ORDER_SIZE_USDT} USDT\n"
+            "• Comisiones por Trade: < 0.001 USDT (Solana)\n"
+            "• Control: Telegram Bot 24/7 en Render"
         )
         send_telegram(msg_start, reply_markup=get_main_menu_markup())
         return True
@@ -455,10 +522,10 @@ def init_exchange(force_exchange_id: str = None):
             if any(term in err_str for term in ["restricted location", "451", "403", "cloudfront", "block access from your country", "forbidden"]):
                 is_cloud_blocked = True
                 notice_msg = (
-                    f"ℹ️ *Aviso de Routing Anti-451 para {target_ex.upper()}*\n\n"
-                    "• *Causa*: Los servidores cloud de Render en EE.UU. reciben HTTP 451/403.\n"
-                    "• *Bypass Automático*: Cotizaciones en tiempo real enrutadas a través de KRAKEN sin interrupciones.\n"
-                    "• *Recomendación*: Cambia a modo Phantom con /phantom (sin bloqueo geográfico) o usa un proxy."
+                    f"ℹ️ Aviso de Routing Anti-451 para {target_ex.upper()}\n\n"
+                    "• Causa: Los servidores cloud de Render en EE.UU. reciben HTTP 451/403.\n"
+                    "• Bypass Automático: Cotizaciones en tiempo real enrutadas a través de KRAKEN sin interrupciones.\n"
+                    "• Recomendación: Cambia a modo Phantom con /phantom (sin bloqueo geográfico) o usa un proxy."
                 )
                 send_telegram(notice_msg, reply_markup=get_main_menu_markup())
                 EXCHANGE_ID = "kraken"
@@ -473,24 +540,25 @@ def init_exchange(force_exchange_id: str = None):
         is_real_money = (not IS_TESTNET) and bool(API_KEY) and ("tu_api" not in API_KEY)
         mode_label = "DINERO REAL (Billetera Exchange)" if is_real_money else "MODO SIMULADOR / TESTNET (Fondos Seguros)"
         feed_label = "KRAKEN GLOBAL FEED" if is_cloud_blocked else EXCHANGE_ID.upper()
-        
+
         msg_start = (
-            "🚀 *Bot Cripto & Divisas Iniciado con Éxito*\n\n"
-            f"• Exchange Activo: *{EXCHANGE_ID.upper()}*\n"
-            f"• Modo de Operación: *{mode_label}*\n"
-            f"• Feed de Mercado: *{feed_label}*\n"
-            f"• Radar Multiactivo: *{len(SYMBOLS)} Activos Monitoreados*\n"
-            f"• Capital de Trading: *{initial_usdt_balance:,.2f} USDT*\n"
-            f"• Tamaño por Orden: *{ORDER_SIZE_USDT} USDT* ({LEVERAGE}x)\n"
-            f"• SL / TP: *{STOP_LOSS_PCT}% / +{TAKE_PROFIT_PCT}%*\n"
-            "• 100% Autónomo: *Sin MetaTrader 5*"
+            "🚀 Bot Cripto & Divisas Iniciado con Éxito\n\n"
+            f"• Exchange Activo: {EXCHANGE_ID.upper()}\n"
+            f"• Modo de Operación: {mode_label}\n"
+            f"• Feed de Mercado: {feed_label}\n"
+            f"• Radar Multiactivo: {len(SYMBOLS)} Activos Monitoreados\n"
+            f"• Capital de Trading: {initial_usdt_balance:,.2f} USDT\n"
+            f"• Tamaño por Orden: {ORDER_SIZE_USDT} USDT ({LEVERAGE}x)\n"
+            f"• SL / TP: {STOP_LOSS_PCT}% / +{TAKE_PROFIT_PCT}%\n"
+            "• 100% Autónomo: Sin MetaTrader 5"
         )
         send_telegram(msg_start, reply_markup=get_main_menu_markup())
         return True
     except Exception as e:
         logging.error(f"Fallo conectando al exchange: {e}")
-        send_telegram(f"❌ *Error de Conexión*: {e}", reply_markup=get_main_menu_markup())
+        send_telegram(f"❌ Error de Conexión: {e}", reply_markup=get_main_menu_markup())
         return False
+
 
 def calculate_technical_signals(symbol: str):
     try:
@@ -516,19 +584,19 @@ def calculate_technical_signals(symbol: str):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['ema_fast'] = df['close'].ewm(span=20, adjust=False).mean()
         df['ema_slow'] = df['close'].ewm(span=50, adjust=False).mean()
-        
+
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / (loss + 1e-9)
         df['rsi'] = 100 - (100 / (1 + rs))
-        
+
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        
+
         buy_signal = bool((prev['ema_fast'] <= prev['ema_slow']) and (last['ema_fast'] > last['ema_slow']) and (last['rsi'] > 50))
         sell_signal = bool((prev['ema_fast'] >= prev['ema_slow']) and (last['ema_fast'] < last['ema_slow']) and (last['rsi'] < 50))
-        
+
         return {
             'symbol': symbol,
             'buy': buy_signal,
@@ -538,8 +606,9 @@ def calculate_technical_signals(symbol: str):
             'ema_fast': float(last['ema_fast']),
             'ema_slow': float(last['ema_slow'])
         }
-    except Exception as e:
+    except Exception:
         return None
+
 
 def execute_crypto_order(symbol: str, side: str, current_price: float):
     try:
@@ -552,12 +621,12 @@ def execute_crypto_order(symbol: str, side: str, current_price: float):
             tp_price = current_price * (1 + (TAKE_PROFIT_PCT / 100.0))
             active_positions[symbol] = {'side': 'BUY', 'entry': current_price, 'amount': amount, 'sl': sl_price, 'tp': tp_price}
             msg = (
-                f"🟢 *COMPRA EJECUTADA ({order_type_str})*\n\n"
-                f"• Exchange: *{EXCHANGE_ID.upper()}*\n"
-                f"• Par: *{symbol}*\n"
-                f"• Entrada: *{current_price:,.4f} USDT*\n"
-                f"• Monto: *{ORDER_SIZE_USDT:.2f} USDT* ({LEVERAGE}x)\n"
-                f"• SL / TP: *{sl_price:,.4f} / {tp_price:,.4f} USDT*"
+                f"🟢 COMPRA EJECUTADA ({order_type_str})\n\n"
+                f"• Exchange: {EXCHANGE_ID.upper()}\n"
+                f"• Par: {symbol}\n"
+                f"• Entrada: {current_price:,.4f} USDT\n"
+                f"• Monto: {ORDER_SIZE_USDT:.2f} USDT ({LEVERAGE}x)\n"
+                f"• SL / TP: {sl_price:,.4f} / {tp_price:,.4f} USDT"
             )
             send_telegram(msg)
         else:
@@ -565,35 +634,38 @@ def execute_crypto_order(symbol: str, side: str, current_price: float):
             tp_price = current_price * (1 - (TAKE_PROFIT_PCT / 100.0))
             active_positions[symbol] = {'side': 'SELL', 'entry': current_price, 'amount': amount, 'sl': sl_price, 'tp': tp_price}
             msg = (
-                f"🔴 *VENTA EJECUTADA ({order_type_str})*\n\n"
-                f"• Exchange: *{EXCHANGE_ID.upper()}*\n"
-                f"• Par: *{symbol}*\n"
-                f"• Entrada: *{current_price:,.4f} USDT*\n"
-                f"• Monto: *{ORDER_SIZE_USDT:.2f} USDT* ({LEVERAGE}x)\n"
-                f"• SL / TP: *{sl_price:,.4f} / {tp_price:,.4f} USDT*"
+                f"🔴 VENTA EJECUTADA ({order_type_str})\n\n"
+                f"• Exchange: {EXCHANGE_ID.upper()}\n"
+                f"• Par: {symbol}\n"
+                f"• Entrada: {current_price:,.4f} USDT\n"
+                f"• Monto: {ORDER_SIZE_USDT:.2f} USDT ({LEVERAGE}x)\n"
+                f"• SL / TP: {sl_price:,.4f} / {tp_price:,.4f} USDT"
             )
             send_telegram(msg)
     except Exception as e:
         logging.error(f"Error orden: {e}")
 
+
 def close_all_crypto_positions():
     active_positions.clear()
-    send_telegram("🔒 *Todas las posiciones han sido cerradas de emergencia.*")
+    send_telegram("🔒 Todas las posiciones han sido cerradas de emergencia.")
+
 
 def send_market_radar_pulse(results: list):
-    lines = [f"📡 *Radar Multiactivo [{EXCHANGE_ID.upper()}] (En Vivo)*\n"]
+    lines = [f"📡 Radar Multiactivo [{EXCHANGE_ID.upper()}] (En Vivo)\n"]
     for r in results:
         status_icon = "🟢 Alcista" if r['rsi'] > 55 else "🔴 Bajista" if r['rsi'] < 45 else "⚪ Neutral"
-        lines.append(f"• *{r['symbol']}*: {r['close']:,.2f} USDT | RSI: {r['rsi']:.1f} ({status_icon})")
+        lines.append(f"• {r['symbol']}: {r['close']:,.2f} USDT | RSI: {r['rsi']:.1f} ({status_icon})")
     send_telegram("\n".join(lines))
+
 
 def run_crypto_loop():
     global cycle_counter
     while not init_exchange():
         time.sleep(30)
-    
+
     logging.info(f"Bot Multiactivo operativo en {EXCHANGE_ID.upper()}...")
-    
+
     while True:
         try:
             state = read_dynamic_state()
@@ -622,8 +694,9 @@ def run_crypto_loop():
             time.sleep(15)
         except KeyboardInterrupt:
             break
-        except Exception as e:
+        except Exception:
             time.sleep(10)
+
 
 if __name__ == "__main__":
     run_crypto_loop()
