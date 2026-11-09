@@ -1,9 +1,4 @@
-"""Paper-only Solana (SOL) perpetual-futures strategy runner.
-
-Uses public spot-market candles as a price feed and a local paper ledger. It does not
-connect a wallet, read exchange credentials, or submit real orders. SOL futures are
-simulated from SOL/USDT prices; Solana itself is not a futures venue.
-"""
+"""Paper-only SOL perpetual-futures simulator; no live orders are submitted."""
 
 import logging
 import os
@@ -14,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ccxt
 import requests
 
+from market_data import MarketDataFeed
 from paper_futures import PaperFutures
 from strategies import STRATEGIES, signal_from_candles
 
@@ -32,7 +28,8 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4"))
 PAPER_FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.0006"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_USDT", "25"))
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "15"))
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
+MARKET_DATA_CACHE_SECONDS = int(os.getenv("MARKET_DATA_CACHE_SECONDS", "60"))
 STATE_PATH = os.getenv("PAPER_STATE_FILE", "paper_account.json")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -43,14 +40,21 @@ if STRATEGY not in STRATEGIES:
     raise ValueError(f"STRATEGY must be one of: {', '.join(STRATEGIES)}")
 if not 1 <= LEVERAGE <= 10:
     raise ValueError("Set LEVERAGE between 1 and 10")
-if min(ORDER_MARGIN_USDT, STARTING_BALANCE, MAX_DAILY_LOSS) <= 0 or SCAN_SECONDS < 1:
-    raise ValueError("Balance, margin, daily loss limit and scan interval must be positive")
+if min(ORDER_MARGIN_USDT, STARTING_BALANCE, MAX_DAILY_LOSS) <= 0:
+    raise ValueError("Balance, margin and daily loss limit must be positive")
+if SCAN_SECONDS < 30:
+    logging.warning("SCAN_SECONDS below 30 is not recommended; using 30 seconds")
+    SCAN_SECONDS = 30
+if MARKET_DATA_CACHE_SECONDS < 30:
+    logging.warning("MARKET_DATA_CACHE_SECONDS below 30 is not recommended; using 30 seconds")
+    MARKET_DATA_CACHE_SECONDS = 30
 if not 0 < PAPER_FEE_RATE < 0.01:
     raise ValueError("PAPER_FEE_RATE must be between 0 and 0.01")
 
 account = PaperFutures(STATE_PATH, STARTING_BALANCE, LEVERAGE, PAPER_FEE_RATE,
                        STOP_LOSS_PCT, TAKE_PROFIT_PCT, MAX_DAILY_LOSS)
 exchange = None
+market_feed = None
 trading_active = True
 
 
@@ -103,10 +107,14 @@ def menu():
 
 
 def create_market_data_client():
-    # Public-only CCXT client: no API keys are read or passed to it.
+    # Public-only CCXT client. Higher interval plus shared cache avoids needless Kraken calls.
     if not hasattr(ccxt, DATA_EXCHANGE):
         raise ValueError(f"Unknown DATA_EXCHANGE: {DATA_EXCHANGE}")
-    client = getattr(ccxt, DATA_EXCHANGE)({"enableRateLimit": True, "timeout": 15000})
+    client = getattr(ccxt, DATA_EXCHANGE)({
+        "enableRateLimit": True,
+        "rateLimit": 3000,
+        "timeout": 20000,
+    })
     client.load_markets()
     if SYMBOL not in client.markets:
         raise ValueError(f"{SYMBOL} is not available on public data venue {DATA_EXCHANGE}")
@@ -114,8 +122,10 @@ def create_market_data_client():
 
 
 def fetch_candles():
-    candles = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
-    if not candles or len(candles) < 60:
+    if market_feed is None:
+        raise RuntimeError("Market-data feed has not been initialized")
+    candles = market_feed.fetch_candles()
+    if len(candles) < 60:
         raise RuntimeError("Not enough candles to calculate the strategy")
     return candles
 
@@ -127,8 +137,8 @@ def make_signal(candles):
 def process_market():
     candles = fetch_candles()
     signal = make_signal(candles)
-    ticker = exchange.fetch_ticker(SYMBOL)
-    mark = float(ticker.get("last") or signal["price"])
+    # Avoid an additional Kraken fetch_ticker call; paper marks use the last closed candle.
+    mark = signal["price"]
     closed = account.check_exit(SYMBOL, signal["high"], signal["low"], mark)
     if closed:
         telegram_send(f"📕 Cierre paper {closed['reason']} {SYMBOL} a {closed['exit']:.4f}; "
@@ -167,8 +177,9 @@ def positions_text():
 
 
 def panic_close():
-    mark = exchange.fetch_ticker(SYMBOL).get("last") if exchange else None
-    return account.close_all({SYMBOL: float(mark)}) if mark else []
+    candles = fetch_candles()
+    mark = float(candles[-2][4])  # most recent closed candle; no separate ticker request
+    return account.close_all({SYMBOL: mark})
 
 
 def handle_update(update):
@@ -203,8 +214,9 @@ def handle_update(update):
             try:
                 sig = make_signal(fetch_candles())
                 telegram_send(f"Radar {SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT, "
-                              f"RSI {sig['rsi']:.1f}, señal: {sig['side'] or 'sin señal'} (paper)", menu(), sender)
+                              f"RSI {sig['rsi']:.1f}, señal: {sig['side'] or 'sin señal'} (paper; datos cacheados)", menu(), sender)
             except Exception as exc:
+                logging.exception("Telegram radar command failed")
                 telegram_send(f"No se pudo obtener el radar: {exc}", menu(), sender)
         return
 
@@ -226,8 +238,9 @@ def handle_update(update):
         try:
             sig = make_signal(fetch_candles())
             text_out = f"{SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT | RSI {sig['rsi']:.1f} | " \
-                       f"{sig['side'] or 'sin señal'} (paper)"
+                       f"{sig['side'] or 'sin señal'} (paper; datos cacheados)"
         except Exception as exc:
+            logging.exception("Telegram radar button failed")
             text_out = f"Radar no disponible: {exc}"
     elif data == "pause":
         trading_active = False
@@ -281,7 +294,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global exchange
+    global exchange, market_feed
     port = int(os.getenv("PORT", "10000"))
     threading.Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
                      daemon=True).start()
@@ -289,12 +302,13 @@ def main():
     while True:
         try:
             exchange = create_market_data_client()
+            market_feed = MarketDataFeed(exchange, SYMBOL, TIMEFRAME, MARKET_DATA_CACHE_SECONDS)
             break
         except Exception:
-            logging.exception("Unable to initialize public market-data client; retrying in 30s")
-            time.sleep(30)
+            logging.exception("Unable to initialize public market-data client; retrying in 60s")
+            time.sleep(60)
     telegram_send(f"🧪 Simulador PAPER iniciado para {SYMBOL}. Estrategia: {STRATEGY}. "
-                  "Solo usa datos públicos; no se envían órdenes reales. /start para controles.", menu())
+                  "Kraken usa cache de datos para limitar consultas; no se envían órdenes reales. /start para controles.", menu())
     while True:
         try:
             signal, mark = process_market()
@@ -303,7 +317,7 @@ def main():
             time.sleep(SCAN_SECONDS)
         except Exception:
             logging.exception("Paper strategy cycle failed")
-            time.sleep(max(SCAN_SECONDS, 5))
+            time.sleep(max(SCAN_SECONDS, 15))
 
 
 if __name__ == "__main__":
