@@ -29,6 +29,9 @@ class PaperFutures:
             "closed_trades": [],
             "daily_realized": 0.0,
             "daily_date": datetime.now(timezone.utc).date().isoformat(),
+            "equity_peak": self.starting_balance,
+            "max_drawdown_abs": 0.0,
+            "max_drawdown_pct": 0.0,
         }
 
     def _load(self):
@@ -37,11 +40,17 @@ class PaperFutures:
                 state = json.load(handle)
             if not isinstance(state.get("positions"), dict) or "available" not in state:
                 raise ValueError("Invalid paper account state")
+            # Backward-compatible migration for ledgers created before performance metrics.
+            state.setdefault("closed_trades", [])
+            state.setdefault("daily_realized", 0.0)
+            state.setdefault("daily_date", datetime.now(timezone.utc).date().isoformat())
+            state.setdefault("equity_peak", self.starting_balance)
+            state.setdefault("max_drawdown_abs", 0.0)
+            state.setdefault("max_drawdown_pct", 0.0)
             return state
         except FileNotFoundError:
             return self._new_state()
         except Exception as exc:
-            # Never silently reset a corrupted account: that would hide the paper ledger.
             raise RuntimeError(f"Cannot load paper account {self.path}: {exc}") from exc
 
     def _save(self):
@@ -135,12 +144,13 @@ class PaperFutures:
 
     def close_all(self, prices):
         closed = []
-        for symbol in list(self.state["positions"]):
-            price = prices.get(symbol)
-            if price is not None:
-                trade = self.close_position(symbol, price, "panic_close")
-                if trade:
-                    closed.append(trade)
+        with self.lock:
+            for symbol in list(self.state["positions"]):
+                price = prices.get(symbol)
+                if price is not None:
+                    trade = self.close_position(symbol, price, "panic_close")
+                    if trade:
+                        closed.append(trade)
         return closed
 
     def snapshot(self, prices=None):
@@ -158,8 +168,32 @@ class PaperFutures:
                 used_margin += position["margin"]
                 positions.append({**position, "mark": mark, "unrealized_pnl": pnl})
             equity = self.state["available"] + used_margin + unrealized
+            peak = max(float(self.state.get("equity_peak", self.starting_balance)), equity)
+            drawdown_abs = max(0.0, peak - equity)
+            drawdown_pct = (drawdown_abs / peak * 100.0) if peak > 0 else 0.0
+            new_max_abs = max(float(self.state.get("max_drawdown_abs", 0.0)), drawdown_abs)
+            new_max_pct = max(float(self.state.get("max_drawdown_pct", 0.0)), drawdown_pct)
+            changed = peak != self.state.get("equity_peak") or new_max_abs != self.state.get("max_drawdown_abs") or new_max_pct != self.state.get("max_drawdown_pct")
+            self.state["equity_peak"] = peak
+            self.state["max_drawdown_abs"] = new_max_abs
+            self.state["max_drawdown_pct"] = new_max_pct
+
+            today = datetime.now(timezone.utc).date().isoformat()
+            today_trades = [trade for trade in self.state["closed_trades"]
+                            if str(trade.get("closed_at", "")).startswith(today)]
+            wins = sum(1 for trade in today_trades if float(trade.get("net_pnl", 0.0)) > 0)
+            losses = sum(1 for trade in today_trades if float(trade.get("net_pnl", 0.0)) < 0)
+            count = len(today_trades)
+            if changed:
+                self._save()
             return {
                 "available": self.state["available"], "equity": equity,
                 "unrealized_pnl": unrealized, "daily_realized": self.state["daily_realized"],
+                "daily_trades": count, "daily_wins": wins, "daily_losses": losses,
+                "daily_win_rate_pct": (wins / count * 100.0) if count else 0.0,
+                "daily_return_pct": (self.state["daily_realized"] / self.starting_balance * 100.0),
                 "positions": positions, "closed_trades": len(self.state["closed_trades"]),
+                "equity_peak": peak, "drawdown_abs": drawdown_abs,
+                "drawdown_pct": drawdown_pct, "max_drawdown_abs": new_max_abs,
+                "max_drawdown_pct": new_max_pct,
             }
