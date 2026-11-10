@@ -1,9 +1,4 @@
-"""Paper-only Solana (SOL) perpetual-futures strategy runner.
-
-Uses public spot-market candles as a price feed and a local paper ledger. It does not
-connect a wallet, read exchange credentials, or submit real orders. SOL futures are
-simulated from SOL/USDT prices; Solana itself is not a futures venue.
-"""
+"""Paper-only SOL perpetual-futures simulator; no live orders are submitted."""
 
 import logging
 import os
@@ -112,6 +107,7 @@ def menu():
 
 
 def create_market_data_client():
+    # Public-only CCXT client. Higher interval plus shared cache avoids needless Kraken calls.
     if not hasattr(ccxt, DATA_EXCHANGE):
         raise ValueError(f"Unknown DATA_EXCHANGE: {DATA_EXCHANGE}")
     client = getattr(ccxt, DATA_EXCHANGE)({"enableRateLimit": True, "rateLimit": 3000, "timeout": 20000})
@@ -125,7 +121,7 @@ def fetch_candles():
     if market_feed is None:
         raise RuntimeError("Market-data feed has not been initialized")
     candles = market_feed.fetch_candles()
-    if not candles or len(candles) < 60:
+    if len(candles) < 60:
         raise RuntimeError("Not enough candles to calculate the strategy")
     return candles
 
@@ -137,32 +133,33 @@ def make_signal(candles):
 def process_market():
     candles = fetch_candles()
     signal = make_signal(candles)
+    # Signals and paper marks use the last closed candle, not an extra ticker request.
     mark = signal["price"]
     closed = account.check_exit(SYMBOL, signal["high"], signal["low"], mark)
     if closed:
         telegram_send(f"📕 Cierre paper {closed['reason']} {SYMBOL} a {closed['exit']:.4f}; "
                       f"PnL neto estimado: {closed['net_pnl']:.2f} USDT", menu())
 
-    # Apply the MQL5 EA's break-even (1 ATR) and trailing (1.5 ATR) behavior to
-    # existing positions. The new stop applies to subsequent candles.
-    if STRATEGY == "multiasset_trend_pro" and signal.get("atr"):
+    # The EA checks break-even at 1 ATR and trails at 1.5 ATR. Updated stops apply
+    # from the next candle because this candle's barriers were checked above.
+    if STRATEGY == "multiasset_trend_pro" and signal.get("atr") is not None:
         if SYMBOL in account.state["positions"]:
             account.update_trailing_stop(SYMBOL, mark, signal["atr"], 1.0, 1.5)
 
     if trading_active and signal["side"] and SYMBOL not in account.state["positions"]:
         try:
-            stop_loss = signal.get("stop_loss")
-            take_profit = signal.get("take_profit")
+            is_mql5_profile = STRATEGY == "multiasset_trend_pro"
             position = account.open_position(
                 SYMBOL, signal["side"], mark, ORDER_MARGIN_USDT,
-                stop_loss=stop_loss, take_profit=take_profit,
+                stop_loss=signal.get("stop_loss") if is_mql5_profile else None,
+                take_profit=signal.get("take_profit") if is_mql5_profile else None,
             )
-            extra = (f" | ADX: {signal['adx']:.1f} | ATR: {signal['atr']:.4f}"
-                     if STRATEGY == "multiasset_trend_pro" else "")
+            detail = (f" | ADX {signal['adx']:.1f} | ATR {signal['atr']:.4f}"
+                      if is_mql5_profile else "")
             telegram_send(f"🧪 APERTURA PAPER {position['side']} {SYMBOL} | estrategia: {STRATEGY}\n"
                           f"Entrada: {mark:.4f} | margen: {ORDER_MARGIN_USDT:.2f} USDT | "
                           f"nocional: {position['notional']:.2f} USDT ({LEVERAGE}x)\n"
-                          f"SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}{extra}\n"
+                          f"SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}{detail}\n"
                           "Solo simulación; no se envió ninguna orden real.", menu())
         except ValueError as exc:
             logging.info("Paper position not opened: %s", exc)
@@ -323,7 +320,7 @@ def main():
             logging.exception("Unable to initialize public market-data client; retrying in 60s")
             time.sleep(60)
     telegram_send(f"🧪 Simulador PAPER iniciado para {SYMBOL}. Estrategia: {STRATEGY}. "
-                  "Solo usa datos públicos; no se envían órdenes reales. /start para controles.", menu())
+                  "Kraken usa cache de datos para limitar consultas; no se envían órdenes reales. /start para controles.", menu())
     while True:
         try:
             signal, mark = process_market()
