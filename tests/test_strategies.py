@@ -31,9 +31,9 @@ class StrategyTests(unittest.TestCase):
 
     def test_mql5_profile_ignores_forming_candle(self):
         baseline = signal_from_candles(self.candles, "multiasset_trend_pro")
-        altered = [row[:] for row in self.candles]
-        altered[-1][4] = 10_000
-        self.assertEqual(baseline, signal_from_candles(altered, "multiasset_trend_pro"))
+        changed = [row[:] for row in self.candles]
+        changed[-1][4] = 10_000
+        self.assertEqual(baseline, signal_from_candles(changed, "multiasset_trend_pro"))
 
     def test_invalid_strategy_rejected(self):
         with self.assertRaises(ValueError):
