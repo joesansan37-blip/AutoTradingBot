@@ -1,7 +1,7 @@
-"""Selectable paper-only SOL/USDT strategy profiles.
+"""Selectable paper-only strategy profiles for SOL/USDT simulation.
 
-Strategies produce signals only; execution remains in the paper ledger. No real orders
-are submitted by this project.
+Strategies generate signals only. Execution is handled by the local paper ledger; this
+project does not submit exchange orders.
 """
 
 import pandas as pd
@@ -10,61 +10,60 @@ STRATEGIES = ("ema_trend", "rsi_reversion", "donchian_breakout", "multiasset_tre
 
 
 def _wilder(series, period):
-    """Wilder smoothing, used to approximate MT5's ADX and ATR indicators."""
+    """Wilder's recursive moving average, approximated with pandas EWM."""
     return series.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
 
 
 def _multiasset_trend_pro(df):
-    """Compute closed-bar EMA(12/26), ADX(14), ATR(14), and EMA-cross signal."""
-    fast_period, slow_period, adx_period, atr_period = 12, 26, 14, 14
+    """MQL5-derived EMA(12/26) cross with ADX(14) filter and ATR stops."""
     close, high, low = df["close"], df["high"], df["low"]
-    ema_fast = close.ewm(span=fast_period, adjust=False).mean()
-    ema_slow = close.ewm(span=slow_period, adjust=False).mean()
-    prev_close = close.shift(1)
-    true_range = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-    atr = _wilder(true_range, atr_period)
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
 
-    up_move, down_move = high.diff(), -low.diff()
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = _wilder(tr, 14)
+
+    up_move = high.diff()
+    down_move = -low.diff()
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-    smoothed_tr = _wilder(true_range, adx_period)
-    plus_di = 100.0 * _wilder(plus_dm, adx_period) / smoothed_tr.replace(0, 1e-12)
-    minus_di = 100.0 * _wilder(minus_dm, adx_period) / smoothed_tr.replace(0, 1e-12)
+    smooth_tr = _wilder(tr, 14)
+    plus_di = 100.0 * _wilder(plus_dm, 14) / smooth_tr.replace(0, 1e-12)
+    minus_di = 100.0 * _wilder(minus_dm, 14) / smooth_tr.replace(0, 1e-12)
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-12)
-    adx = _wilder(dx, adx_period)
+    adx = _wilder(dx, 14)
 
-    last_idx, prev_idx = len(df) - 1, len(df) - 2
-    atr_value, adx_value = atr.iloc[last_idx], adx.iloc[last_idx]
+    i, prev_i = len(df) - 1, len(df) - 2
+    atr_now, adx_now = atr.iloc[i], adx.iloc[i]
     result = {
         "side": None,
-        "ema_fast": float(ema_fast.iloc[last_idx]),
-        "ema_slow": float(ema_slow.iloc[last_idx]),
-        "atr": float(atr_value) if pd.notna(atr_value) else None,
-        "adx": float(adx_value) if pd.notna(adx_value) else None,
+        "adx": float(adx_now) if pd.notna(adx_now) else None,
+        "atr": float(atr_now) if pd.notna(atr_now) else None,
         "stop_loss": None,
         "take_profit": None,
     }
-    if result["atr"] is None or result["adx"] is None:
+    if result["atr"] is None or result["adx"] is None or result["adx"] < 22.0:
         return result
 
-    price = float(close.iloc[last_idx])
-    if result["adx"] >= 22.0:
-        if ema_fast.iloc[last_idx] > ema_slow.iloc[last_idx] and ema_fast.iloc[prev_idx] <= ema_slow.iloc[prev_idx]:
-            result.update(side="LONG", stop_loss=price - result["atr"] * 1.8,
-                          take_profit=price + result["atr"] * 3.0)
-        elif ema_fast.iloc[last_idx] < ema_slow.iloc[last_idx] and ema_fast.iloc[prev_idx] >= ema_slow.iloc[prev_idx]:
-            result.update(side="SHORT", stop_loss=price + result["atr"] * 1.8,
-                          take_profit=price - result["atr"] * 3.0)
+    price = float(close.iloc[i])
+    crossed_up = ema_fast.iloc[i] > ema_slow.iloc[i] and ema_fast.iloc[prev_i] <= ema_slow.iloc[prev_i]
+    crossed_down = ema_fast.iloc[i] < ema_slow.iloc[i] and ema_fast.iloc[prev_i] >= ema_slow.iloc[prev_i]
+    if crossed_up:
+        result.update(side="LONG", stop_loss=price - result["atr"] * 1.8,
+                      take_profit=price + result["atr"] * 3.0)
+    elif crossed_down:
+        result.update(side="SHORT", stop_loss=price + result["atr"] * 1.8,
+                      take_profit=price - result["atr"] * 3.0)
     return result
 
 
 def signal_from_candles(candles, strategy="ema_trend"):
-    """Return a signal using closed OHLCV candles only.
+    """Return a signal using closed OHLCV bars only.
 
-    Every profile returns strategy, side, price, high, low, and RSI. The converted MQL5
-    profile additionally returns ADX, ATR, and ATR-derived stop/target levels.
+    Standard result fields: strategy, side (LONG/SHORT/None), price, high, low, rsi.
+    The ``multiasset_trend_pro`` profile also returns ``adx``, ``atr``, ``stop_loss``
+    and ``take_profit``. Like all indicator ports, it is an approximation of MT5.
     """
     strategy = strategy.strip().lower()
     if strategy not in STRATEGIES:
@@ -72,7 +71,7 @@ def signal_from_candles(candles, strategy="ema_trend"):
     if not candles or len(candles) < 60:
         raise ValueError("At least 60 candles are needed")
 
-    # The final CCXT OHLCV candle may still be forming; do not use it for signals.
+    # The final CCXT candle may still be forming. Exclude it from every indicator.
     df = pd.DataFrame(candles[:-1], columns=["time", "open", "high", "low", "close", "volume"])
     for column in ("open", "high", "low", "close", "volume"):
         df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -95,7 +94,6 @@ def signal_from_candles(candles, strategy="ema_trend"):
             side = "LONG"
         elif prev.ema_fast >= prev.ema_slow and last.ema_fast < last.ema_slow and last.rsi < 50:
             side = "SHORT"
-
     elif strategy == "rsi_reversion":
         df["bb_mid"] = close.rolling(20).mean()
         std = close.rolling(20).std(ddof=0)
@@ -105,7 +103,6 @@ def signal_from_candles(candles, strategy="ema_trend"):
             side = "LONG"
         elif prev.close >= prev.bb_upper and last.close < last.bb_upper and prev.rsi > 65 and last.rsi < prev.rsi:
             side = "SHORT"
-
     elif strategy == "donchian_breakout":
         lookback, last = df.iloc[-21:-1], df.iloc[-1]
         upper, lower = float(lookback["high"].max()), float(lookback["low"].min())
@@ -113,8 +110,7 @@ def signal_from_candles(candles, strategy="ema_trend"):
             side = "LONG"
         elif last.close < lower and last.close < last.ema_slow:
             side = "SHORT"
-
-    elif strategy == "multiasset_trend_pro":
+    else:
         extras = _multiasset_trend_pro(df)
         side = extras["side"]
 
