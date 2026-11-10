@@ -1,4 +1,4 @@
-"""Paper-only SOL perpetual futures simulator; no exchange orders are submitted."""
+"""Paper-only SOL perpetual futures ledger; no exchange orders are submitted."""
 
 import json
 import os
@@ -88,7 +88,7 @@ class PaperFutures:
             return dict(position)
 
     def update_trailing_stop(self, symbol, price, atr, breakeven_atr=1.0, trailing_atr=1.5):
-        """Move paper stop to break-even and then trail by ATR, only in risk-reducing direction."""
+        """Tighten a paper stop using break-even and ATR-trailing thresholds."""
         with self.lock:
             position = self.state["positions"].get(symbol)
             price, atr = float(price), float(atr)
@@ -140,7 +140,7 @@ class PaperFutures:
             return trade
 
     def check_exit(self, symbol, high, low, last_price):
-        """Check candle barriers; if both hit in one candle, conservatively use the stop."""
+        """Check barriers; if both hit in one candle, conservatively use the stop."""
         with self.lock:
             position = self.state["positions"].get(symbol)
             if not position:
