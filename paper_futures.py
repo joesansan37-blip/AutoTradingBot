@@ -1,14 +1,13 @@
 """Paper-only SOL perpetual futures simulator; no exchange orders are submitted."""
 
 import json
-import logging
 import os
 import threading
 from datetime import datetime, timezone
 
 
 class PaperFutures:
-    """Persistent, isolated paper account for a linear USDT-margined SOL contract."""
+    """Persistent paper account for a linear USDT-margined contract."""
 
     def __init__(self, state_path, starting_balance, leverage, fee_rate, stop_loss_pct,
                  take_profit_pct, max_daily_loss):
@@ -23,13 +22,8 @@ class PaperFutures:
         self.state = self._load()
 
     def _new_state(self):
-        return {
-            "available": self.starting_balance,
-            "positions": {},
-            "closed_trades": [],
-            "daily_realized": 0.0,
-            "daily_date": datetime.now(timezone.utc).date().isoformat(),
-        }
+        return {"available": self.starting_balance, "positions": {}, "closed_trades": [],
+                "daily_realized": 0.0, "daily_date": datetime.now(timezone.utc).date().isoformat()}
 
     def _load(self):
         try:
@@ -41,7 +35,6 @@ class PaperFutures:
         except FileNotFoundError:
             return self._new_state()
         except Exception as exc:
-            # Never silently reset a corrupted account: that would hide the paper ledger.
             raise RuntimeError(f"Cannot load paper account {self.path}: {exc}") from exc
 
     def _save(self):
@@ -60,7 +53,7 @@ class PaperFutures:
             self.state["daily_date"] = today
             self.state["daily_realized"] = 0.0
 
-    def open_position(self, symbol, side, price, margin):
+    def open_position(self, symbol, side, price, margin, stop_loss=None, take_profit=None):
         with self.lock:
             self._roll_day()
             side = side.upper()
@@ -77,18 +70,51 @@ class PaperFutures:
             if required > self.state["available"]:
                 raise ValueError("Insufficient paper balance for margin plus entry fee")
             qty = notional / price
-            sl = price * (1 - self.stop_loss_pct if side == "LONG" else 1 + self.stop_loss_pct)
-            tp = price * (1 + self.take_profit_pct if side == "LONG" else 1 - self.take_profit_pct)
-            position = {
-                "symbol": symbol, "side": side, "entry": price, "quantity": qty,
-                "margin": margin, "notional": notional, "entry_fee": entry_fee,
-                "stop_loss": sl, "take_profit": tp,
-                "opened_at": datetime.now(timezone.utc).isoformat(),
-            }
+            default_sl = price * (1 - self.stop_loss_pct if side == "LONG" else 1 + self.stop_loss_pct)
+            default_tp = price * (1 + self.take_profit_pct if side == "LONG" else 1 - self.take_profit_pct)
+            sl = float(stop_loss) if stop_loss is not None else default_sl
+            tp = float(take_profit) if take_profit is not None else default_tp
+            if side == "LONG" and not (0 < sl < price < tp):
+                raise ValueError("LONG stop/target must satisfy 0 < stop < entry < target")
+            if side == "SHORT" and not (0 < tp < price < sl):
+                raise ValueError("SHORT stop/target must satisfy 0 < target < entry < stop")
+            position = {"symbol": symbol, "side": side, "entry": price, "quantity": qty,
+                        "margin": margin, "notional": notional, "entry_fee": entry_fee,
+                        "stop_loss": sl, "take_profit": tp,
+                        "opened_at": datetime.now(timezone.utc).isoformat()}
             self.state["available"] -= required
             self.state["positions"][symbol] = position
             self._save()
             return dict(position)
+
+    def update_trailing_stop(self, symbol, price, atr, breakeven_atr=1.0, trailing_atr=1.5):
+        """Move paper stop to break-even and then trail by ATR, only in risk-reducing direction."""
+        with self.lock:
+            position = self.state["positions"].get(symbol)
+            price, atr = float(price), float(atr)
+            if not position or price <= 0 or atr <= 0:
+                return False
+            entry, old_stop = position["entry"], position["stop_loss"]
+            if position["side"] == "LONG":
+                candidate = old_stop
+                if price >= entry + atr * breakeven_atr:
+                    candidate = max(candidate, entry * (1 + 1e-8))
+                if price >= entry + atr * trailing_atr:
+                    candidate = max(candidate, price - atr * trailing_atr)
+                candidate = min(candidate, price * (1 - 1e-8))
+                changed = candidate > old_stop
+            else:
+                candidate = old_stop
+                if price <= entry - atr * breakeven_atr:
+                    candidate = min(candidate, entry * (1 - 1e-8))
+                if price <= entry - atr * trailing_atr:
+                    candidate = min(candidate, price + atr * trailing_atr)
+                candidate = max(candidate, price * (1 + 1e-8))
+                changed = candidate < old_stop
+            if changed:
+                position["stop_loss"] = candidate
+                self._save()
+            return changed
 
     def close_position(self, symbol, price, reason="manual"):
         with self.lock:
@@ -104,11 +130,9 @@ class PaperFutures:
             net = gross - position["entry_fee"] - exit_fee
             self.state["available"] += position["margin"] + gross - exit_fee
             self.state["daily_realized"] += net
-            trade = {
-                **position, "exit": price, "gross_pnl": gross,
-                "exit_fee": exit_fee, "net_pnl": net, "reason": reason,
-                "closed_at": datetime.now(timezone.utc).isoformat(),
-            }
+            trade = {**position, "exit": price, "gross_pnl": gross, "exit_fee": exit_fee,
+                     "net_pnl": net, "reason": reason,
+                     "closed_at": datetime.now(timezone.utc).isoformat()}
             self.state["closed_trades"].append(trade)
             self.state["closed_trades"] = self.state["closed_trades"][-500:]
             del self.state["positions"][symbol]
@@ -147,9 +171,7 @@ class PaperFutures:
         with self.lock:
             self._roll_day()
             prices = prices or {}
-            positions = []
-            unrealized = 0.0
-            used_margin = 0.0
+            positions, unrealized, used_margin = [], 0.0, 0.0
             for symbol, position in self.state["positions"].items():
                 mark = float(prices.get(symbol, position["entry"]))
                 direction = 1 if position["side"] == "LONG" else -1
@@ -158,8 +180,6 @@ class PaperFutures:
                 used_margin += position["margin"]
                 positions.append({**position, "mark": mark, "unrealized_pnl": pnl})
             equity = self.state["available"] + used_margin + unrealized
-            return {
-                "available": self.state["available"], "equity": equity,
-                "unrealized_pnl": unrealized, "daily_realized": self.state["daily_realized"],
-                "positions": positions, "closed_trades": len(self.state["closed_trades"]),
-            }
+            return {"available": self.state["available"], "equity": equity,
+                    "unrealized_pnl": unrealized, "daily_realized": self.state["daily_realized"],
+                    "positions": positions, "closed_trades": len(self.state["closed_trades"])}
