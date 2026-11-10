@@ -1,34 +1,44 @@
-# AutoTradingBot — simulador de futuros de SOL
+from strategy import StrategyConfig, calculate_position_margin, signal_from_candles
 
-Esta rama sustituye el modo de ejecución por un **simulador paper-only** de una posición lineal USDT-margined sobre `SOL/USDT`. Las señales se calculan con velas públicas de CCXT. El ledger, las posiciones, comisiones estimadas, SL/TP y PnL son simulados y se guardan en `paper_account.json`.
 
-> **No se conecta a Phantom ni a un DEX, no lee claves de exchange y no envía órdenes reales.** La red Solana no es un exchange de futuros; este primer simulador modela un futuro perpetuo sobre SOL a partir de precios públicos. No modela funding, slippage ni liquidaciones. Si el servicio se reinicia, el archivo `paper_account.json` debe persistir para mantener el ledger (configura un disco persistente en Render).
+def _candles_for_signal(trend: str, length: int = 120):
+    candles = []
+    price = 100.0
+    for i in range(length):
+        if i < 80:
+            close = 100.0 + ((i % 7) - 3) * 0.2
+        else:
+            close = 100.0 + (i - 79) * 0.75 if trend == "long" else 100.0 - (i - 79) * 0.75
+        open_price = close - 0.4
+        high = max(open_price, close) + 0.8
+        low = min(open_price, close) - 0.8
+        candles.append([i * 60000, open_price, high, low, close, 1000.0])
+    return candles
 
-## Configuración en Render
 
-- `EXECUTION_MODE=paper` (único modo aceptado; cualquier otro valor hace que el programa se detenga)
-- `DATA_EXCHANGE=kraken` (solo lectura pública; el exchange debe ofrecer `SOL/USDT`)
-- `TRADING_SYMBOL=SOL/USDT`
-- `TIMEFRAME=15m`
-- `PAPER_STARTING_BALANCE_USDT=500`
-- `ORDER_MARGIN_USDT=25` — margen simulado por operación; el nocional es margen × apalancamiento
-- `LEVERAGE=2` — permitido de 1 a 10
-- `STOP_LOSS_PCT=2`
-- `TAKE_PROFIT_PCT=4`
-- `PAPER_FEE_RATE=0.0006` — comisión simulada por cada lado de la operación
-- `MAX_DAILY_LOSS_USDT=25`
-- `SCAN_SECONDS=15`
-- `PAPER_STATE_FILE=/ruta/persistente/paper_account.json`
-- `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` para los avisos y controles opcionales
+def test_bullish_signal_detected():
+    signal = signal_from_candles(_candles_for_signal("long"), StrategyConfig())
+    assert signal["side"] == "LONG"
+    assert signal["rsi"] >= 55
 
-No configures `API_KEY` o `API_SECRET`: el cliente de mercado es público y la aplicación no implementa ejecución real.
 
-## Telegram
+def test_bearish_signal_detected():
+    signal = signal_from_candles(_candles_for_signal("short"), StrategyConfig())
+    assert signal["side"] == "SHORT"
+    assert signal["rsi"] <= 45
 
-`/start`, `/balance`, `/positions`, `/radar`, `/pause`, `/resume`, `/panic`. Los botones del menú ofrecen las mismas acciones. Si se configura `TELEGRAM_CHAT_ID`, se ignoran actualizaciones de otros chats. Al pausar, el bot deja de abrir posiciones pero continúa comprobando SL/TP de las abiertas.
 
-La estrategia abre paper-long o paper-short cuando el cruce EMA20/EMA50 en una vela cerrada coincide con el filtro RSI. SL/TP se comprueban con máximos/mínimos de velas; si ambos niveles aparecen tocados en la misma vela, el simulador asigna conservadoramente el stop.
+def test_position_margin_is_capped_by_risk_budget():
+    margin = calculate_position_margin(500.0, 25.0, risk_pct=0.05, min_margin=5.0, max_margin=200.0)
+    assert margin == 25.0
 
-## Prueba
+    margin_low_equity = calculate_position_margin(40.0, 25.0, risk_pct=0.05, min_margin=5.0, max_margin=200.0)
+    assert margin_low_equity == 5.0
 
-Despliega primero en un entorno de prueba y revisa balance, posiciones y cierres en Telegram y en el ledger persistente. El PnL es una estimación educativa, no una garantía de ejecución ni de resultados futuros.
+    margin_small_base = calculate_position_margin(1000.0, 3.0, risk_pct=0.05, min_margin=5.0, max_margin=200.0)
+    assert margin_small_base == 3.0
+
+
+# coverage to keep the strategy robust for a real market cycle
+__all__ = ["StrategyConfig", "signal_from_candles", "calculate_position_margin"]
+

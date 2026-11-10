@@ -1,0 +1,8 @@
+ccxt>=4.2.0
+python-telegram-bot>=20.7
+requests>=2.31.0
+pandas>=2.2.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+pytest>=8.0.0
+
