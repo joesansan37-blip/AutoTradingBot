@@ -1,0 +1,9 @@
+# Keep credentials and local ledgers out of version control.
+.env
+.env.*
+!.env.example
+paper_account.json
+paper_account.json.tmp
+__pycache__/
+.pytest_cache/
+*.py[cod]
