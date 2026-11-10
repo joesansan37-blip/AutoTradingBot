@@ -1,4 +1,9 @@
-"""Paper-only SOL perpetual-futures simulator; no live orders are submitted."""
+"""Paper-only Solana (SOL) perpetual-futures strategy runner.
+
+Uses public spot-market candles as a price feed and a local paper ledger. It does not
+connect a wallet, read exchange credentials, or submit real orders. SOL futures are
+simulated from SOL/USDT prices; Solana itself is not a futures venue.
+"""
 
 import logging
 import os
@@ -107,14 +112,9 @@ def menu():
 
 
 def create_market_data_client():
-    # Public-only CCXT client. Higher interval plus shared cache avoids needless Kraken calls.
     if not hasattr(ccxt, DATA_EXCHANGE):
         raise ValueError(f"Unknown DATA_EXCHANGE: {DATA_EXCHANGE}")
-    client = getattr(ccxt, DATA_EXCHANGE)({
-        "enableRateLimit": True,
-        "rateLimit": 3000,
-        "timeout": 20000,
-    })
+    client = getattr(ccxt, DATA_EXCHANGE)({"enableRateLimit": True, "rateLimit": 3000, "timeout": 20000})
     client.load_markets()
     if SYMBOL not in client.markets:
         raise ValueError(f"{SYMBOL} is not available on public data venue {DATA_EXCHANGE}")
@@ -125,7 +125,7 @@ def fetch_candles():
     if market_feed is None:
         raise RuntimeError("Market-data feed has not been initialized")
     candles = market_feed.fetch_candles()
-    if len(candles) < 60:
+    if not candles or len(candles) < 60:
         raise RuntimeError("Not enough candles to calculate the strategy")
     return candles
 
@@ -137,19 +137,32 @@ def make_signal(candles):
 def process_market():
     candles = fetch_candles()
     signal = make_signal(candles)
-    # Avoid an additional Kraken fetch_ticker call; paper marks use the last closed candle.
     mark = signal["price"]
     closed = account.check_exit(SYMBOL, signal["high"], signal["low"], mark)
     if closed:
         telegram_send(f"📕 Cierre paper {closed['reason']} {SYMBOL} a {closed['exit']:.4f}; "
                       f"PnL neto estimado: {closed['net_pnl']:.2f} USDT", menu())
+
+    # Apply the MQL5 EA's break-even (1 ATR) and trailing (1.5 ATR) behavior to
+    # existing positions. The new stop applies to subsequent candles.
+    if STRATEGY == "multiasset_trend_pro" and signal.get("atr"):
+        if SYMBOL in account.state["positions"]:
+            account.update_trailing_stop(SYMBOL, mark, signal["atr"], 1.0, 1.5)
+
     if trading_active and signal["side"] and SYMBOL not in account.state["positions"]:
         try:
-            position = account.open_position(SYMBOL, signal["side"], mark, ORDER_MARGIN_USDT)
+            stop_loss = signal.get("stop_loss")
+            take_profit = signal.get("take_profit")
+            position = account.open_position(
+                SYMBOL, signal["side"], mark, ORDER_MARGIN_USDT,
+                stop_loss=stop_loss, take_profit=take_profit,
+            )
+            extra = (f" | ADX: {signal['adx']:.1f} | ATR: {signal['atr']:.4f}"
+                     if STRATEGY == "multiasset_trend_pro" else "")
             telegram_send(f"🧪 APERTURA PAPER {position['side']} {SYMBOL} | estrategia: {STRATEGY}\n"
                           f"Entrada: {mark:.4f} | margen: {ORDER_MARGIN_USDT:.2f} USDT | "
                           f"nocional: {position['notional']:.2f} USDT ({LEVERAGE}x)\n"
-                          f"SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}\n"
+                          f"SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}{extra}\n"
                           "Solo simulación; no se envió ninguna orden real.", menu())
         except ValueError as exc:
             logging.info("Paper position not opened: %s", exc)
@@ -178,7 +191,7 @@ def positions_text():
 
 def panic_close():
     candles = fetch_candles()
-    mark = float(candles[-2][4])  # most recent closed candle; no separate ticker request
+    mark = float(candles[-2][4])
     return account.close_all({SYMBOL: mark})
 
 
@@ -213,8 +226,9 @@ def handle_update(update):
         elif text.startswith("/radar"):
             try:
                 sig = make_signal(fetch_candles())
+                detail = f", ADX {sig['adx']:.1f}, ATR {sig['atr']:.4f}" if STRATEGY == "multiasset_trend_pro" else ""
                 telegram_send(f"Radar {SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT, "
-                              f"RSI {sig['rsi']:.1f}, señal: {sig['side'] or 'sin señal'} (paper; datos cacheados)", menu(), sender)
+                              f"RSI {sig['rsi']:.1f}{detail}, señal: {sig['side'] or 'sin señal'} (paper; datos cacheados)", menu(), sender)
             except Exception as exc:
                 logging.exception("Telegram radar command failed")
                 telegram_send(f"No se pudo obtener el radar: {exc}", menu(), sender)
@@ -237,7 +251,8 @@ def handle_update(update):
     elif data == "radar":
         try:
             sig = make_signal(fetch_candles())
-            text_out = f"{SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT | RSI {sig['rsi']:.1f} | " \
+            detail = f" | ADX {sig['adx']:.1f} | ATR {sig['atr']:.4f}" if STRATEGY == "multiasset_trend_pro" else ""
+            text_out = f"{SYMBOL} [{STRATEGY}]: {sig['price']:.4f} USDT | RSI {sig['rsi']:.1f}{detail} | " \
                        f"{sig['side'] or 'sin señal'} (paper; datos cacheados)"
         except Exception as exc:
             logging.exception("Telegram radar button failed")
@@ -308,7 +323,7 @@ def main():
             logging.exception("Unable to initialize public market-data client; retrying in 60s")
             time.sleep(60)
     telegram_send(f"🧪 Simulador PAPER iniciado para {SYMBOL}. Estrategia: {STRATEGY}. "
-                  "Kraken usa cache de datos para limitar consultas; no se envían órdenes reales. /start para controles.", menu())
+                  "Solo usa datos públicos; no se envían órdenes reales. /start para controles.", menu())
     while True:
         try:
             signal, mark = process_market()
